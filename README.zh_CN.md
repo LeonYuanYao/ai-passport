@@ -65,7 +65,7 @@ tools/install-mic-agent.sh                     # launchd agent，登录即启
    豆包里把麦克风选成*它*。豆包会拒绝 Core Audio 传输类型为 `Virtual` 的设备，而
    BlackHole 报告的正是 `Virtual`；聚合设备报告 `Unknown`，能通过。
    **BlackHole 自己永远不会出现在豆包的列表里 —— 整件事的关键就在这一步。**
-3. **豆包的语音快捷键必须设为右 Option**，因为 agent 在每次录音期间一直按住这个键。
+3. **豆包的语音快捷键必须设为右 Command**，因为 agent 在每次录音期间一直按住这个键。
 
 验证：按下键，出声数到三。星星应该变大，文字应该出现。
 `tail -f /tmp/aipassport-mic.log` 能看到 agent 在做什么，

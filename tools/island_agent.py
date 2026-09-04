@@ -51,6 +51,17 @@ DEFAULT_EMIT = os.path.expanduser("~/.claude/island_quota.bin")
 # 482-byte packet size.
 DEV_FRAME = 480
 
+# BLE identity and characteristic UUIDs must match main/voice_ble.c.  Keep these
+# at module scope because both the scan/reconnect loop and notification setup use
+# them.
+BLE_NAME = "AI-Passport-Mic"
+BLE_UUID_AUDIO = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+BLE_UUID_CTRL = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+
+# macOS virtual key code kVK_RightCommand. PyAutoGUI exposes only the left-side
+# Command key, so the push-to-talk modifier is posted through Quartz instead.
+DOUBAO_HOLD_KEYCODE = 0x36
+
 
 def _ulaw_table():
     """256-entry int16 lookup, the exact inverse of voice_ulaw_encode in C.
@@ -257,6 +268,7 @@ def cmd_recv_ble(args):
         return 1
     try:
         import pyautogui
+        from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
     except ImportError:
         pyautogui = None
     else:
@@ -284,7 +296,8 @@ def cmd_recv_ble(args):
         # later in startup: the device-selection failure returns below exit first, and
         # those are exactly the crash-loop startups most likely to follow a death
         # mid-take. Before any audio stream or event loop exists, so it cannot race.
-        pyautogui.keyUp("optionright")
+        CGEventPost(kCGHIDEventTap,
+                    CGEventCreateKeyboardEvent(None, DOUBAO_HOLD_KEYCODE, False))
 
     SRC_RATE = 16000                              # device audio rate
     device = args.device
@@ -565,7 +578,8 @@ def cmd_recv_ble(args):
         # return at the guard above, and leave the key physically down — 豆包 records
         # forever. A spurious keyUp is harmless; a missed one is not.
         held[0] = down
-        (pyautogui.keyDown if down else pyautogui.keyUp)("optionright")
+        CGEventPost(kCGHIDEventTap,
+                    CGEventCreateKeyboardEvent(None, DOUBAO_HOLD_KEYCODE, down))
         # Stamp the release here, not at the call sites: it happens on either the
         # drain thread or the backstop timer, and stamping in only one of them left
         # the span unreported whenever the other won.
@@ -958,6 +972,14 @@ def cmd_recv_ble(args):
 
 
 def cmd_selftest(_args):
+    # Host and firmware must agree on the BLE endpoint contract.  These checks
+    # also catch an accidental deletion of the module-level constants before the
+    # hardware-only recv-ble path reaches them.
+    assert BLE_NAME == "AI-Passport-Mic"
+    assert BLE_UUID_AUDIO == "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+    assert BLE_UUID_CTRL == "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+    assert DOUBAO_HOLD_KEYCODE == 0x36  # macOS kVK_RightCommand
+
     # Round-trip and edge cases must match main/island_quota.c exactly.
     p = pack(30, 1893456000)
     assert len(p) == ISLAND_LEN and p[0] == MAGIC and p[1] == 30

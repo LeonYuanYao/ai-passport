@@ -78,7 +78,7 @@ Then three settings that are easy to miss:
    Core Audio transport type is `Virtual`, which is what BlackHole reports; an
    aggregate device reports `Unknown` and passes. **BlackHole itself will never
    appear in Doubao's list — this is the step everything hinges on.**
-3. **Doubao's dictation shortcut must be right Option**, because the agent holds
+3. **Doubao's dictation shortcut must be right Command**, because the agent holds
    that key for the length of each recording.
 
 Check it: press DOWN, count to three aloud. The spark should grow, and text should

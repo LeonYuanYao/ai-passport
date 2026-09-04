@@ -36,7 +36,7 @@ the default captures the loopback and yields silence. This tool therefore picks 
 built-in microphone explicitly.
 
 Requires the same Accessibility permission the agent needs, Doubao focused on an
-empty text field, and its shortcut set to right Option.
+empty text field, and its shortcut set to right Command.
 """
 import argparse
 import json
@@ -54,13 +54,18 @@ def _deps():
         import sounddevice as sd
         import pyautogui
         from AppKit import NSPasteboard
+        from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
     except ImportError as e:
         print(f"measure_accuracy: missing dependency ({e}). "
               "pip install numpy sounddevice pyautogui pyobjc-framework-Cocoa",
               file=sys.stderr)
         raise SystemExit(1)
     pyautogui.PAUSE = 0
-    return np, sd, pyautogui, NSPasteboard
+    def hold_doubao_key(down):
+        # kVK_RightCommand. PyAutoGUI's generic "command" is the left key.
+        event = CGEventCreateKeyboardEvent(None, 0x36, down)
+        CGEventPost(kCGHIDEventTap, event)
+    return np, sd, pyautogui, NSPasteboard, hold_doubao_key
 
 
 def find_output(np, sd, name):
@@ -146,7 +151,7 @@ def cmd_record(args):
 
 
 def cmd_score(args):
-    np, sd, pyautogui, NSPasteboard = _deps()
+    np, sd, pyautogui, NSPasteboard, hold_doubao_key = _deps()
     ref_path = args.wav + ".txt"
     if not os.path.exists(ref_path):
         print(f"measure_accuracy: no reference text at {ref_path} — "
@@ -173,12 +178,12 @@ def cmd_score(args):
         pyautogui.hotkey("command", "a")
         pyautogui.press("delete")           # start from an empty field
         time.sleep(0.2)
-        pyautogui.keyDown("optionright")    # arm Doubao, as the agent does
+        hold_doubao_key(True)               # arm Doubao, as the agent does
         time.sleep(0.10)                    # the agent's prebuffer
         sd.play(stereo, samplerate=out_rate, device=device)
         sd.wait()
         time.sleep(0.45)                    # Doubao revises the tail
-        pyautogui.keyUp("optionright")
+        hold_doubao_key(False)
         time.sleep(args.settle)
 
         pb.clearContents()
