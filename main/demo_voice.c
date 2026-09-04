@@ -63,6 +63,7 @@ typedef enum { ST_CONNECTING, ST_IDLE, ST_RECORDING, ST_ERROR } voice_state_t;
 static lv_obj_t *s_scr;
 static lv_obj_t *s_title;
 static lv_obj_t *s_link_dot;
+static lv_obj_t *s_link_state;
 static lv_obj_t *s_big;
 static lv_obj_t *s_sub;
 static lv_obj_t *s_battery;
@@ -122,6 +123,7 @@ static bool s_have_quota;
 static island_usage_t s_usage;
 static bool s_have_usage;
 static bool s_usage_dirty;
+static bool s_ever_linked;
 static int s_drawn_state = -1;
 static unsigned s_battery_poll_ms;
 
@@ -143,6 +145,7 @@ static void set_state(voice_state_t st)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_state = st;
+    if (st == ST_IDLE || st == ST_RECORDING) s_ever_linked = true;
     xSemaphoreGive(s_lock);
 }
 
@@ -595,6 +598,7 @@ static void render(lv_timer_t *t)
     island_quota_t q = s_quota;
     bool have_usage = s_have_usage;
     bool usage_dirty = s_usage_dirty;
+    bool ever_linked = s_ever_linked;
     island_usage_t usage = s_usage;
     s_usage_dirty = false;
     xSemaphoreGive(s_lock);
@@ -635,6 +639,12 @@ static void render(lv_timer_t *t)
     uint32_t link_color = st == ST_CONNECTING ? DASH_MUTED :
                           st == ST_ERROR ? UI_RED : DASH_SIGNAL;
     lv_obj_set_style_bg_color(s_link_dot, lv_color_hex(link_color), 0);
+    const char *link_text = st == ST_ERROR ? "连接错误" :
+                            st == ST_CONNECTING ?
+                                (ever_linked ? "连接丢失" : "连接中") :
+                                "已连接";
+    lv_label_set_text(s_link_state, link_text);
+    lv_obj_set_style_text_color(s_link_state, lv_color_hex(link_color), 0);
     lv_obj_set_style_text_opa(s_title,
         st == ST_CONNECTING ? LV_OPA_50 : LV_OPA_COVER, 0);
 
@@ -650,7 +660,7 @@ static void render(lv_timer_t *t)
     else snprintf(cl, sizeof(cl), "%d%%", q.remaining_pct);
     if (!have_q || q.codex_remaining_pct < 0) snprintf(cx, sizeof(cx), "--");
     else snprintf(cx, sizeof(cx), "%d%%", q.codex_remaining_pct);
-    lv_label_set_text_fmt(s_island, "QUOTA  C %s  X %s", cl, cx);
+    lv_label_set_text_fmt(s_island, "CLAUDE %s  CODEX %s", cl, cx);
 
     if (s_drawn_state != (int)st) {
         bool dashboard = st == ST_IDLE;
@@ -711,6 +721,7 @@ void demo_voice_enter(void)
     s_have_quota = false;
     s_have_usage = false;
     s_usage_dirty = false;
+    s_ever_linked = false;
     s_drawn_state = -1;
     memset(&s_usage, 0, sizeof(s_usage));
     s_lock = xSemaphoreCreateMutex();
@@ -725,6 +736,10 @@ void demo_voice_enter(void)
     s_link_dot = dashboard_block(s_scr, 12, 17, 7, 7, DASH_MUTED, 4);
     s_title = dashboard_label(s_scr, "AI PASSPORT", 26, 10,
                               &lv_font_montserrat_14, DASH_PAPER);
+    s_link_state = dashboard_label(s_scr, "连接中", 120, 10,
+                                   &lv_font_ai_passport_14, DASH_MUTED);
+    lv_obj_set_width(s_link_state, 60);
+    lv_obj_set_style_text_align(s_link_state, LV_TEXT_ALIGN_RIGHT, 0);
     dashboard_block(s_scr, 12, 39, 216, 1, DASH_LINE, 0);
 
     s_battery = dashboard_label(s_scr, "--%", 184, 10,
@@ -797,7 +812,7 @@ void demo_voice_enter(void)
                                          model_colors[i], 2);
     }
 
-    s_island = dashboard_label(s_scr, "QUOTA  C --  X --", 14, 287,
+    s_island = dashboard_label(s_scr, "CLAUDE --  CODEX --", 14, 287,
                                &lv_font_montserrat_14, DASH_MUTED);
     set_visible(s_usage_layer, false);
     set_visible(s_voice_layer, true);

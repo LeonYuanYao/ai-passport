@@ -92,35 +92,63 @@ def _ulaw_table():
     return out
 
 
+def _codex_weekly_used(rate_limits):
+    """Return the 7-day Codex used percentage independent of bucket position."""
+    if not isinstance(rate_limits, dict):
+        return None
+    weekly = []
+    for name in ("primary", "secondary"):
+        bucket = rate_limits.get(name)
+        if not isinstance(bucket, dict):
+            continue
+        window = bucket.get("window_minutes")
+        used = bucket.get("used_percent")
+        if (isinstance(window, (int, float)) and not isinstance(window, bool) and
+                window >= 7 * 24 * 60 and isinstance(used, (int, float)) and
+                not isinstance(used, bool)):
+            weekly.append((window, used))
+    if not weekly:
+        return None
+    return float(max(weekly, key=lambda item: item[0])[1])
+
+
 def codex_used_percentage():
     """Codex's 7-day used %, read from its newest session log, or None.
 
     Codex has no statusline hook, but its CLI records the server's rate-limit
-    reply verbatim in each session rollout. The last such line in the newest
-    rollout is the freshest number available locally. `secondary` is the 7-day
-    window (`primary` is a 5-hour window), matching Claude's seven_day bucket so
-    the two figures on the island mean the same thing.
+    reply verbatim in each session rollout. Bucket position is not stable: older
+    replies used secondary for seven days, while current Pro replies can put the
+    10080-minute window in primary. Select by duration so both layouts work.
     """
     import glob
     logs = sorted(glob.glob(os.path.expanduser(
         "~/.codex/sessions/*/*/*/rollout-*.jsonl")), reverse=True)
     for path in logs[:5]:                 # newest few: the latest may have none yet
         try:
-            with open(path, "r", errors="replace") as f:
-                blob = f.read()
+            with open(path, "rb") as f:
+                # Rate-limit snapshots recur during an active session. Reading
+                # only the tail avoids rescanning a rollout hundreds of MB large
+                # every 30 seconds in the always-on microphone daemon.
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 8 * 1024 * 1024))
+                blob = f.read().decode("utf-8", errors="replace")
         except OSError:
             continue
-        # Scan from the end: later lines are more recent.
-        idx = blob.rfind('"rate_limits"')
+        marker = '"rate_limits"'
+        idx = blob.rfind(marker)
         while idx >= 0:
-            tail = blob[idx:idx + 400]
-            m = re.search(r'"secondary":\s*\{[^}]*?"used_percent":\s*([0-9.]+)', tail)
-            if m:
+            colon = blob.find(":", idx + len(marker))
+            if colon >= 0:
                 try:
-                    return float(m.group(1))
-                except ValueError:
-                    pass
-            idx = blob.rfind('"rate_limits"', 0, idx)
+                    limits, _ = json.JSONDecoder().raw_decode(
+                        blob[colon + 1:].lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    limits = None
+                used = _codex_weekly_used(limits)
+                if used is not None:
+                    return used
+            idx = blob.rfind(marker, 0, idx)
     return None
 
 
@@ -441,11 +469,36 @@ def _busiest_pct():
     return top
 
 
-def _read_quota(path):
-    """Read the quota packet from disk. Called off the event loop: a synchronous
-    read on the loop that dispatches BLE notifications stalls the audio stream."""
-    with open(path, "rb") as f:
-        return f.read()
+def build_quota_packet(path, codex_used=None):
+    """Build current quota telemetry even when Claude has no statusline cache.
+
+    The binary cache carries Claude's seven-day percentage. Codex is refreshed
+    independently from its rollout metadata, because hiding a valid Codex number
+    merely because the unrelated Claude cache is absent made the whole footer
+    appear broken.
+    """
+    claude_used = None
+    resets_at = 0
+    try:
+        with open(path, "rb") as stream:
+            cached = stream.read()
+    except OSError:
+        cached = b""
+
+    if len(cached) in (ISLAND_LEN_V1, ISLAND_LEN):
+        fold = 0
+        for value in cached:
+            fold ^= value
+        raw_used = cached[1]
+        if fold == 0 and cached[0] == MAGIC and (
+                raw_used == UNKNOWN or 0 <= raw_used <= 100):
+            if raw_used != UNKNOWN:
+                claude_used = raw_used
+                resets_at = struct.unpack("<I", cached[2:6])[0]
+
+    if codex_used is None:
+        codex_used = codex_used_percentage()
+    return pack(claude_used, resets_at, codex_used)
 
 
 def cmd_recv_ble(args):
@@ -1090,8 +1143,8 @@ def cmd_recv_ble(args):
                 # the number changes every 30 s and nobody is watching it mid-take.
                 if tick % 15 == 0 and not held[0]:   # 15 * 2 s = 30 s
                     try:
-                        q = await asyncio.to_thread(_read_quota, args.emit)
-                    except OSError:
+                        q = await asyncio.to_thread(build_quota_packet, args.emit)
+                    except (OSError, ValueError):
                         q = None
                     if q and len(q) in (ISLAND_LEN_V1, ISLAND_LEN) and q != last_q:
                         await client.write_gatt_char(BLE_UUID_CTRL, q, response=False)
@@ -1223,6 +1276,31 @@ def cmd_selftest(_args):
     assert _seven_day({"seven_day": {}}) == (None, None)
     assert _seven_day({}) == (None, None)
     assert _seven_day(None) == (None, None)
+
+    # Codex has emitted both layouts over time: the 7-day bucket used to be
+    # `secondary`, while current Pro sessions can put the 10080-minute window in
+    # `primary` and leave `secondary` null. Select by duration, not position.
+    assert _codex_weekly_used({
+        "primary": {"used_percent": 71, "window_minutes": 10080},
+        "secondary": None,
+    }) == 71
+    assert _codex_weekly_used({
+        "primary": {"used_percent": 12, "window_minutes": 300},
+        "secondary": {"used_percent": 34, "window_minutes": 10080},
+    }) == 34
+
+    # The BLE daemon must still produce a packet when Claude's statusline cache
+    # does not exist. Otherwise a valid Codex quota is silently hidden too.
+    with tempfile.TemporaryDirectory() as tmp:
+        quota_path = os.path.join(tmp, "missing-quota.bin")
+        quota = build_quota_packet(quota_path, codex_used=71)
+        assert len(quota) == ISLAND_LEN
+        assert quota[1] == UNKNOWN and quota[6] == 71
+        with open(quota_path, "wb") as stream:
+            stream.write(pack(30, 1893456000, codex_used=9))
+        quota = build_quota_packet(quota_path, codex_used=71)
+        assert quota[1] == 30 and quota[6] == 71
+        assert struct.unpack("<I", quota[2:6])[0] == 1893456000
 
     # Usage aggregation is tested at its public seam: Codex/Claude JSONL metadata
     # in, one 24-hour/top-model snapshot out. Message text is deliberately absent
