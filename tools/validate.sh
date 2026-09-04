@@ -41,6 +41,10 @@ run_static_checks() {
         -o "${test_dir}/test_island_quota"
     "${test_dir}/test_island_quota"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_island_usage.c main/island_usage.c \
+        -o "${test_dir}/test_island_usage"
+    "${test_dir}/test_island_usage"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_voice_proto.c main/voice_proto.c \
         -o "${test_dir}/test_voice_proto"
     "${test_dir}/test_voice_proto"

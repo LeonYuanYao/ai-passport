@@ -31,7 +31,7 @@ static uint16_t s_audio_val_handle;
 static uint16_t s_ctrl_val_handle;
 static volatile bool s_audio_subscribed;
 static volatile bool s_running;
-static voice_ble_quota_cb_t s_quota_cb;
+static voice_ble_data_cb_t s_data_cb;
 // Signalled from the NimBLE host task when a notification completes, so a sender
 // blocks until the pool can actually supply an mbuf rather than polling for one.
 static SemaphoreHandle_t s_tx_done;
@@ -43,23 +43,25 @@ static unsigned s_audio_alloc_fail, s_audio_append_fail, s_audio_oversize;
 static unsigned s_audio_notify_fail;
 static int s_audio_last_rc;
 
-void voice_ble_set_quota_cb(voice_ble_quota_cb_t cb)
+void voice_ble_set_data_cb(voice_ble_data_cb_t cb)
 {
-    s_quota_cb = cb;
+    s_data_cb = cb;
 }
 
 static int gatt_access(uint16_t conn, uint16_t attr,
                        struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     (void)conn; (void)attr; (void)arg;
-    // The PC writes quota packets (island_quota wire format) to the control
-    // characteristic; audio/ctrl notifications are handled elsewhere.
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && s_quota_cb != NULL) {
+    // The PC writes compact quota/usage packets to the control characteristic;
+    // audio/ctrl notifications travel in the opposite direction.
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && s_data_cb != NULL) {
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-        uint8_t buf[16];
+        // Largest current packet is the 105-byte usage snapshot. Keep a little
+        // versioning headroom without allocating from the heap in the host task.
+        uint8_t buf[128];
         if (len > 0 && len <= sizeof(buf) &&
             ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &len) == 0) {
-            s_quota_cb(buf, len);
+            s_data_cb(buf, len);
         }
     }
     return 0;

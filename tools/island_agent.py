@@ -12,28 +12,34 @@ Two unrelated jobs share this file because they share the device link:
      before changing ANY latency or buffer value here — several of them look
      wasteful and are not, with the measurements to prove it.
 
-  2. Claude usage island:
+  2. Usage dashboard:
         island_agent.py statusline [--emit PATH]   # Claude Code hook, JSON on stdin
         island_agent.py send --port /dev/tty.usbmodem1234
      The merged 7-day quota only exists on the machine running Claude Code, in the
      statusline stdin JSON under `rate_limits.seven_day`. `statusline` prints your
      normal statusline AND writes the packet the device parses; `send` forwards it
      over USB-serial. recv-ble also pushes it over BLE between takes, which is how
-     it actually reaches the device in normal use. Claude Code only sends
+     it actually reaches the device in normal use. The BLE agent also aggregates
+     the last 24 hours of local Codex/Claude usage metadata into hourly buckets
+     and top-model totals, then pushes a compact snapshot every five minutes. It never
+     sends prompt or response text. Claude Code only sends
      rate_limits to Pro/Max subscribers, so on a plain API key it emits the
      "unknown" packet and the device shows 未知 rather than a stale ring.
 
-Wire formats are the single source of truth in main/island_quota.h and
-main/voice_proto.h. Keep this file in step with both.
+Wire formats are the single source of truth in main/island_quota.h,
+main/island_usage.h, and main/voice_proto.h. Keep this file in step with them.
 
     island_agent.py selftest    # asserts pack/round-trip and mu-law, no hardware
 """
 import argparse
+import datetime as dt
+import glob
 import json
 import os
 import re
 import struct
 import sys
+import tempfile
 
 MAGIC = 0x51
 # Kept in step with main/island_quota.h: 8 bytes now that a Codex byte is carried,
@@ -42,6 +48,13 @@ ISLAND_LEN = 8
 ISLAND_LEN_V1 = 7
 UNKNOWN = 0xFF
 DEFAULT_EMIT = os.path.expanduser("~/.claude/island_quota.bin")
+
+USAGE_MAGIC = 0x55
+USAGE_VERSION = 1
+USAGE_HOURS = 24
+USAGE_MODELS = 3
+USAGE_MODEL_NAME_LEN = 12
+USAGE_LEN = 105
 
 # Device audio frame: 480 mu-law bytes, 30 ms at 16 kHz. Kept here rather than
 # inside cmd_recv_ble so selftest can assert it against the device's own figure.
@@ -146,6 +159,200 @@ def _seven_day(rate_limits):
     if isinstance(resets, (int, float)):
         return used, int(resets)
     return used, 0
+
+
+def _parse_timestamp(value):
+    """Parse a JSONL timestamp without accepting locale-dependent formats."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _recent_paths(pattern, since):
+    """Return files that may contain events in the requested window.
+
+    A long-running session can start before the window, so filename dates are not
+    sufficient. Modification time is only a cheap rejection filter; timestamps in
+    each record make the final decision.
+    """
+    out = []
+    for path in glob.glob(os.path.expanduser(pattern), recursive=True):
+        try:
+            if os.path.getmtime(path) >= since.timestamp():
+                out.append(path)
+        except OSError:
+            pass
+    return out
+
+
+def _claude_message_tokens(usage):
+    if not isinstance(usage, dict):
+        return 0
+    fields = ("input_tokens", "cache_creation_input_tokens",
+              "cache_read_input_tokens", "output_tokens")
+    total = 0
+    for field in fields:
+        value = usage.get(field, 0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += max(0, int(value))
+    return total
+
+
+def collect_usage_snapshot(now=None, codex_paths=None, claude_paths=None):
+    """Aggregate local Codex and Claude metadata into 24 hourly buckets.
+
+    Only timestamps, model identifiers, and usage counters are inspected. Codex
+    emits cumulative per-session totals, so deltas are attributed to the active
+    turn model. Claude may repeat one streaming message in JSONL; message IDs are
+    deduplicated and only the largest/final usage value is counted.
+    """
+    now = now or dt.datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    start = current_hour - dt.timedelta(hours=USAGE_HOURS - 1)
+    end = current_hour + dt.timedelta(hours=1)
+
+    if codex_paths is None:
+        codex_paths = _recent_paths(
+            "~/.codex/sessions/*/*/*/rollout-*.jsonl", start)
+    if claude_paths is None:
+        claude_paths = _recent_paths("~/.claude/projects/**/*.jsonl", start)
+
+    hourly = [0] * USAGE_HOURS
+    by_model = {}
+
+    def add(timestamp, model, tokens):
+        if timestamp is None or tokens <= 0:
+            return
+        local = timestamp.astimezone(now.tzinfo)
+        if local < start or local >= end:
+            return
+        bucket = int((local - start).total_seconds() // 3600)
+        if not 0 <= bucket < USAGE_HOURS:
+            return
+        name = model if isinstance(model, str) and model else "unknown"
+        hourly[bucket] += tokens
+        by_model[name] = by_model.get(name, 0) + tokens
+
+    for path in codex_paths:
+        active_model = "codex"
+        previous_total = 0
+        try:
+            with open(path, "r", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    payload = record.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if record.get("type") == "turn_context" and isinstance(
+                            payload.get("model"), str):
+                        active_model = payload["model"]
+                        continue
+                    if payload.get("type") != "token_count":
+                        continue
+                    total_usage = (payload.get("info") or {}).get(
+                        "total_token_usage") or {}
+                    total = total_usage.get("total_tokens")
+                    if not isinstance(total, (int, float)) or isinstance(total, bool):
+                        continue
+                    total = max(0, int(total))
+                    delta = total - previous_total if total >= previous_total else total
+                    previous_total = total
+                    add(_parse_timestamp(record.get("timestamp")), active_model,
+                        delta)
+        except OSError:
+            continue
+
+    claude_messages = {}
+    for path in claude_paths:
+        try:
+            with open(path, "r", errors="replace") as stream:
+                for line_no, line in enumerate(stream):
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if record.get("type") != "assistant":
+                        continue
+                    message = record.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    tokens = _claude_message_tokens(message.get("usage"))
+                    timestamp = _parse_timestamp(record.get("timestamp"))
+                    message_id = message.get("id")
+                    key = message_id if isinstance(message_id, str) else (
+                        path, line_no)
+                    previous = claude_messages.get(key)
+                    if previous is None or tokens > previous[2]:
+                        claude_messages[key] = (
+                            timestamp, message.get("model") or "claude", tokens)
+        except OSError:
+            continue
+    for timestamp, model, tokens in claude_messages.values():
+        add(timestamp, model, tokens)
+
+    models = sorted(by_model.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "start_hour": start.hour,
+        "total": sum(hourly),
+        "hourly": hourly,
+        "models": models[:USAGE_MODELS],
+    }
+
+
+def _usage_model_label(model):
+    label = model.upper()
+    if label.startswith("CLAUDE-"):
+        label = label[len("CLAUDE-"):]
+    label = re.sub(r"[^A-Z0-9._-]", "-", label)
+    return label.encode("ascii", errors="ignore")[:USAGE_MODEL_NAME_LEN - 1]
+
+
+def _tokens_to_10k(tokens, limit):
+    value = max(0, int(tokens))
+    return min(limit, (value + 5000) // 10000)
+
+
+def pack_usage(snapshot):
+    """Pack a usage snapshot into the fixed 105-byte device wire format."""
+    hourly = snapshot.get("hourly")
+    if not isinstance(hourly, list) or len(hourly) != USAGE_HOURS:
+        raise ValueError("usage snapshot must contain 24 hourly buckets")
+    models = snapshot.get("models") or []
+    body = bytearray(USAGE_LEN - 1)
+    body[0] = USAGE_MAGIC
+    body[1] = USAGE_VERSION
+    body[2] = max(0, min(23, int(snapshot.get("start_hour", 0))))
+    body[3] = min(USAGE_MODELS, len(models))
+    struct.pack_into("<I", body, 4,
+                     _tokens_to_10k(snapshot.get("total", 0), 0xffffffff))
+    for index, tokens in enumerate(hourly):
+        struct.pack_into("<H", body, 8 + index * 2,
+                         _tokens_to_10k(tokens, 0xffff))
+    for index, (model, tokens) in enumerate(models[:USAGE_MODELS]):
+        offset = 56 + index * 16
+        name = _usage_model_label(model)
+        body[offset:offset + len(name)] = name
+        struct.pack_into("<I", body, offset + USAGE_MODEL_NAME_LEN,
+                         _tokens_to_10k(tokens, 0xffffffff))
+    checksum = 0
+    for value in body:
+        checksum ^= value
+    return bytes(body) + bytes([checksum])
+
+
+def build_usage_packet():
+    return pack_usage(collect_usage_snapshot())
 
 
 def cmd_statusline(args):
@@ -872,6 +1079,7 @@ def cmd_recv_ble(args):
             # keeps args.emit fresh; write it to the control characteristic so the
             # device's island updates. Every 30 s (and once right away).
             last_q = None
+            last_usage = None
             tick = 0
             while client.is_connected:
                 # The quota push is housekeeping and must not disturb the audio
@@ -888,6 +1096,23 @@ def cmd_recv_ble(args):
                     if q and len(q) in (ISLAND_LEN_V1, ISLAND_LEN) and q != last_q:
                         await client.write_gatt_char(BLE_UUID_CTRL, q, response=False)
                         last_q = q
+                # The dashboard changes much less often than quota. Build it off
+                # the BLE event loop because scanning JSONL metadata can take tens
+                # of milliseconds; write only when idle and only when its packed
+                # value changed. No message text is included in the snapshot.
+                # Local Codex logs can be hundreds of MB. Five-minute refreshes
+                # keep the dashboard useful without repeatedly walking them in a
+                # daemon whose primary job is low-latency microphone forwarding.
+                if tick % 150 == 0 and not held[0]:  # 150 * 2 s = 5 min
+                    try:
+                        usage = await asyncio.to_thread(build_usage_packet)
+                    except (OSError, ValueError) as e:
+                        print(f"island: usage snapshot failed: {e}", file=sys.stderr)
+                        usage = None
+                    if usage and usage != last_usage:
+                        await client.write_gatt_char(BLE_UUID_CTRL, usage,
+                                                     response=False)
+                        last_usage = usage
                 # Watchdog: the key is only legitimately held while audio flows. If
                 # it is held but nothing has arrived for 20 s the link is gone and
                 # the STOP notify will never come, so release rather than leave 豆包
@@ -998,6 +1223,76 @@ def cmd_selftest(_args):
     assert _seven_day({"seven_day": {}}) == (None, None)
     assert _seven_day({}) == (None, None)
     assert _seven_day(None) == (None, None)
+
+    # Usage aggregation is tested at its public seam: Codex/Claude JSONL metadata
+    # in, one 24-hour/top-model snapshot out. Message text is deliberately absent
+    # from these fixtures because the collector must never need to read it.
+    now = dt.datetime(2026, 9, 4, 15, 30,
+                      tzinfo=dt.timezone(dt.timedelta(hours=8)))
+    with tempfile.TemporaryDirectory() as tmp:
+        codex_path = os.path.join(tmp, "codex.jsonl")
+        claude_path = os.path.join(tmp, "claude.jsonl")
+        with open(codex_path, "w") as f:
+            rows = [
+                {"timestamp": "2026-09-04T06:00:00Z", "type": "turn_context",
+                 "payload": {"model": "gpt-5.6-sol"}},
+                {"timestamp": "2026-09-04T06:10:00Z", "type": "event_msg",
+                 "payload": {"type": "token_count", "info": {
+                     "total_token_usage": {"total_tokens": 100000}}}},
+                {"timestamp": "2026-09-04T06:20:00Z", "type": "event_msg",
+                 "payload": {"type": "token_count", "info": {
+                     "total_token_usage": {"total_tokens": 250000}}}},
+                {"timestamp": "2026-09-04T06:30:00Z", "type": "turn_context",
+                 "payload": {"model": "gpt-5.5"}},
+                {"timestamp": "2026-09-04T06:40:00Z", "type": "event_msg",
+                 "payload": {"type": "token_count", "info": {
+                     "total_token_usage": {"total_tokens": 300000}}}},
+            ]
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        with open(claude_path, "w") as f:
+            base = {"type": "assistant", "timestamp": "2026-09-04T05:05:00Z",
+                    "message": {"id": "msg_test", "model": "claude-opus-5",
+                                "usage": {"input_tokens": 2,
+                                          "cache_creation_input_tokens": 59968,
+                                          "cache_read_input_tokens": 0,
+                                          "output_tokens": 20}}}
+            f.write(json.dumps(base) + "\n")
+            base["message"]["usage"]["output_tokens"] = 30
+            f.write(json.dumps(base) + "\n")  # same message: replace, do not add
+
+        snap = collect_usage_snapshot(now=now, codex_paths=[codex_path],
+                                      claude_paths=[claude_path])
+        assert snap["total"] == 360000, snap
+        assert snap["hourly"][21] == 60000, snap["hourly"]  # 13:00 local
+        assert snap["hourly"][22] == 300000, snap["hourly"] # 14:00 local
+        assert snap["models"] == [
+            ("gpt-5.6-sol", 250000),
+            ("claude-opus-5", 60000),
+            ("gpt-5.5", 50000),
+        ], snap["models"]
+
+    fixture = {
+        "start_hour": 16,
+        "total": 644600000,
+        "hourly": [63900000] + [0] * 11 + [72900000] + [0] * 11,
+        "models": [("gpt-5.6-sol", 400700000),
+                   ("gpt-5.5", 223200000),
+                   ("claude-opus-5", 20600000)],
+    }
+    u = pack_usage(fixture)
+    assert len(u) == USAGE_LEN and u[0] == USAGE_MAGIC and u[1] == USAGE_VERSION
+    assert u[2] == 16 and u[3] == 3
+    assert struct.unpack_from("<I", u, 4)[0] == 64460
+    assert struct.unpack_from("<H", u, 8)[0] == 6390
+    assert struct.unpack_from("<H", u, 8 + 12 * 2)[0] == 7290
+    assert u[56:68].rstrip(b"\0") == b"GPT-5.6-SOL"
+    assert u[72:84].rstrip(b"\0") == b"GPT-5.5"
+    assert u[88:100].rstrip(b"\0") == b"OPUS-5"
+    fold = 0
+    for b in u:
+        fold ^= b
+    assert fold == 0
 
     # mu-law: the same reference vectors tests/test_voice_proto.c asserts against
     # the C encoder. The two implementations are on opposite ends of the wire, so a

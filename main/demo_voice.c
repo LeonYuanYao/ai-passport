@@ -19,7 +19,7 @@
 #include "bsp_display.h"     // 低功耗模式调背光,见 VOICE_DIM_AFTER_MS
 #include "bsp_battery.h"
 #include "island_quota.h"
-#include "mascot.h"
+#include "island_usage.h"
 #include "ui_pixel.h"
 #include "voice_ble.h"
 #include "voice_proto.h"
@@ -31,6 +31,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "demo_voice";
@@ -61,19 +62,23 @@ typedef enum { ST_CONNECTING, ST_IDLE, ST_RECORDING, ST_ERROR } voice_state_t;
 
 static lv_obj_t *s_scr;
 static lv_obj_t *s_title;
+static lv_obj_t *s_link_dot;
 static lv_obj_t *s_big;
 static lv_obj_t *s_sub;
 static lv_obj_t *s_battery;
 static lv_obj_t *s_island;
-static lv_obj_t *s_mascot;
-// Which frame is on screen. LVGL redraws only invalidated areas and skips the
-// refresh entirely when nothing is invalid, so an unchanged image costs 0 us per
-// tick — but swapping the source invalidates all 96x96 px, which at a 240x20 draw
-// buffer is 5 SPI flushes (~0.96 ms). Only swap when the frame actually changes:
-// this screen shares its single core with the BLE audio worker, and redraw time
-// comes straight out of the microphone's frame budget.
-static const lv_image_dsc_t *s_shown_frame;
-static int s_band;               // level band currently shown, for hysteresis
+static lv_obj_t *s_usage_kicker;
+static lv_obj_t *s_usage_layer;
+static lv_obj_t *s_voice_layer;
+static lv_obj_t *s_meter;
+static lv_obj_t *s_total;
+static lv_obj_t *s_peak;
+static lv_obj_t *s_hour_bar[ISLAND_USAGE_HOUR_COUNT];
+static lv_obj_t *s_axis[4];
+static lv_obj_t *s_model_name[ISLAND_USAGE_MODEL_COUNT];
+static lv_obj_t *s_model_value[ISLAND_USAGE_MODEL_COUNT];
+static lv_obj_t *s_model_bar[ISLAND_USAGE_MODEL_COUNT];
+static lv_obj_t *s_model_dot[ISLAND_USAGE_MODEL_COUNT];
 static lv_timer_t *s_timer;
 
 static SemaphoreHandle_t s_lock;
@@ -114,6 +119,11 @@ static unsigned s_tx_ok;       // frames the BLE stack accepted (diagnostic)
 static int s_battery_percent = -1;
 static island_quota_t s_quota;
 static bool s_have_quota;
+static island_usage_t s_usage;
+static bool s_have_usage;
+static bool s_usage_dirty;
+static int s_drawn_state = -1;
+static unsigned s_battery_poll_ms;
 
 // Integer square root, bit-by-bit restoring. Keeps float sqrt out of the audio
 // worker for a value that only drives a 0..100 display.
@@ -136,16 +146,26 @@ static void set_state(voice_state_t st)
     xSemaphoreGive(s_lock);
 }
 
-// BLE host task calls this when the PC writes a quota packet to the control
-// characteristic. Parse and stash under the lock; render() picks it up.
-static void on_quota(const uint8_t *data, size_t len)
+// The NimBLE host task delivers both small quota packets and the larger usage
+// snapshot here. Parsing happens before the lock; the critical section only
+// copies a validated value so it cannot stall the audio worker.
+static void on_telemetry(const uint8_t *data, size_t len)
 {
     island_quota_t q;
-    if (!island_quota_parse(data, len, &q)) return;
-    if (s_lock == NULL) return;
+    island_usage_t usage;
+    bool is_quota = island_quota_parse(data, len, &q);
+    bool is_usage = !is_quota && island_usage_parse(data, len, &usage);
+    if ((!is_quota && !is_usage) || s_lock == NULL) return;
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_quota = q;
-    s_have_quota = true;
+    if (is_quota) {
+        s_quota = q;
+        s_have_quota = true;
+    } else {
+        s_usage = usage;
+        s_have_usage = true;
+        s_usage_dirty = true;
+    }
     xSemaphoreGive(s_lock);
 }
 
@@ -162,12 +182,14 @@ static void worker_task(void *arg)
     s_backlog = false;
     bool capturing = false;
 
+    // Install the sink before advertising starts. A previously paired Mac can
+    // reconnect and write its initial snapshot immediately after BLE sync.
+    voice_ble_set_data_cb(on_telemetry);
     if (voice_ble_start() != ESP_OK) {
         ESP_LOGW(TAG, "BLE start failed");
         set_state(ST_ERROR);
         goto done;
     }
-    voice_ble_set_quota_cb(on_quota);   // PC pushes Claude quota over the same link
     if (bsp_audio_set_format(VOICE_SAMPLE_RATE, 16, 1) != ESP_OK) {
         ESP_LOGW(TAG, "audio format set failed");
         set_state(ST_ERROR);
@@ -202,6 +224,10 @@ static void worker_task(void *arg)
             s_read_us = s_send_us = s_retry_us = 0;
             s_first_frame_us = 0;
             s_record_start_us = esp_timer_get_time();
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_tx_frames = 0;
+            s_tx_ok = 0;
+            xSemaphoreGive(s_lock);
             ESP_LOGI(TAG, "recording START");
             voice_ble_send_ctrl(VOICE_CTRL_START);
             set_state(ST_RECORDING);
@@ -377,7 +403,7 @@ static void worker_task(void *arg)
     }
 
 done:
-    voice_ble_set_quota_cb(NULL);
+    voice_ble_set_data_cb(NULL);
     voice_ble_stop();
     s_worker = NULL;
     xSemaphoreGive(s_worker_done);
@@ -425,6 +451,117 @@ void demo_voice_wake(void)
     if (s_timer != NULL) lv_timer_set_period(s_timer, VOICE_TICK_MS);
 }
 
+// The chosen Type A dashboard keeps the prototype's dark instrument-panel
+// vocabulary while retaining the product palette in its four data accents.
+#define DASH_VOID     0x050606
+#define DASH_SURFACE  0x0B0D0D
+#define DASH_LINE     0x292D2C
+#define DASH_PAPER    0xF2F1EB
+#define DASH_MUTED    0x777C79
+#define DASH_VOICE    0xFF9B73
+#define DASH_SIGNAL   0x76D8A0
+#define DASH_QUOTA    0xF3C36B
+#define DASH_BLUE     0x79A8E8
+
+static lv_obj_t *dashboard_block(lv_obj_t *parent, int x, int y, int w, int h,
+                                 uint32_t color, int radius)
+{
+    lv_obj_t *obj = lv_obj_create(parent);
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_set_style_radius(obj, radius, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
+    return obj;
+}
+
+static lv_obj_t *dashboard_label(lv_obj_t *parent, const char *text, int x, int y,
+                                 const lv_font_t *font, uint32_t color)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+    return label;
+}
+
+static void set_visible(lv_obj_t *obj, bool visible)
+{
+    if (visible) lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void format_tokens(char *dst, size_t size, uint32_t tokens_10k)
+{
+    if (tokens_10k >= 100) {
+        snprintf(dst, size, "%u.%uM", (unsigned)(tokens_10k / 100),
+                 (unsigned)(tokens_10k % 100 / 10));
+    } else if (tokens_10k > 0) {
+        snprintf(dst, size, "%uK", (unsigned)(tokens_10k * 10));
+    } else {
+        snprintf(dst, size, "--");
+    }
+}
+
+// Usage objects are restyled only when a new five-minute PC snapshot
+// arrives. They never participate in the 10 Hz recording redraw hot path.
+static void refresh_usage(const island_usage_t *usage, bool have_usage)
+{
+    static const uint32_t colors[ISLAND_USAGE_MODEL_COUNT] = {
+        DASH_VOICE, DASH_QUOTA, DASH_SIGNAL,
+    };
+    char text[24];
+    uint16_t peak = 0;
+
+    if (have_usage) {
+        format_tokens(text, sizeof(text), usage->total_10k);
+        lv_label_set_text(s_total, text);
+        for (size_t i = 0; i < ISLAND_USAGE_HOUR_COUNT; ++i) {
+            if (usage->hourly_10k[i] > peak) peak = usage->hourly_10k[i];
+        }
+        char peak_text[16];
+        format_tokens(peak_text, sizeof(peak_text), peak);
+        snprintf(text, sizeof(text), "PEAK %s", peak_text);
+        lv_label_set_text(s_peak, text);
+    } else {
+        lv_label_set_text(s_total, "--");
+        lv_label_set_text(s_peak, "PC DATA --");
+    }
+
+    for (size_t i = 0; i < ISLAND_USAGE_HOUR_COUNT; ++i) {
+        int height = have_usage ? island_usage_bar_height(
+            usage->hourly_10k[i], peak, 43) : 0;
+        lv_obj_set_y(s_hour_bar[i], 58 + 43 - height);
+        lv_obj_set_height(s_hour_bar[i], height);
+    }
+
+    for (size_t i = 0; i < 4; ++i) {
+        unsigned hour = have_usage ? (usage->start_hour + i * 6) % 24 : i * 6;
+        snprintf(text, sizeof(text), "%02u", hour);
+        lv_label_set_text(s_axis[i], text);
+    }
+
+    for (size_t i = 0; i < ISLAND_USAGE_MODEL_COUNT; ++i) {
+        bool present = have_usage && i < usage->model_count;
+        lv_label_set_text(s_model_name[i], present ? usage->models[i].name : "--");
+        format_tokens(text, sizeof(text), present ? usage->models[i].tokens_10k : 0);
+        lv_label_set_text(s_model_value[i], text);
+        uint32_t width = 0;
+        if (present && usage->total_10k > 0) {
+            width = (uint32_t)((uint64_t)usage->models[i].tokens_10k * 174 /
+                               usage->total_10k);
+            if (width > 174) width = 174;
+            if (width == 0 && usage->models[i].tokens_10k > 0) width = 2;
+        }
+        lv_obj_set_width(s_model_bar[i], width);
+        lv_obj_set_style_bg_color(s_model_dot[i], lv_color_hex(colors[i]), 0);
+        lv_obj_set_style_bg_color(s_model_bar[i], lv_color_hex(colors[i]), 0);
+    }
+}
+
 static void render(lv_timer_t *t)
 {
     (void)t;
@@ -437,12 +574,14 @@ static void render(lv_timer_t *t)
         if (!state_dims(s_state)) demo_voice_wake();
         return;
     }
-    // Outside s_lock on purpose. bsp_battery_soc() is a blocking I2C transaction
-    // (~0.5 ms on a 100 kHz bus), and the audio worker takes this same mutex once
-    // per 30 ms frame — see the note above s_level. s_battery_percent is written
-    // only here and in enter(), never by the worker, so it never needed the lock.
-    int bp = bsp_battery_soc();
-    if (bp >= 0) s_battery_percent = bp;
+    // Battery changes slowly. Polling the blocking I2C gauge at the old 10 Hz
+    // render rate bought no visible freshness and stole time from BLE audio.
+    s_battery_poll_ms += VOICE_TICK_MS;
+    if (s_battery_percent < 0 || s_battery_poll_ms >= 5000) {
+        int bp = bsp_battery_soc();
+        if (bp >= 0) s_battery_percent = bp;
+        s_battery_poll_ms = 0;
+    }
 
     voice_state_t st;
     unsigned ms;
@@ -454,9 +593,15 @@ static void render(lv_timer_t *t)
     ok = s_tx_ok;
     bool have_q = s_have_quota;
     island_quota_t q = s_quota;
+    bool have_usage = s_have_usage;
+    bool usage_dirty = s_usage_dirty;
+    island_usage_t usage = s_usage;
+    s_usage_dirty = false;
     xSemaphoreGive(s_lock);
     int lvl = s_level;          // plain volatile: deliberately not under s_lock,
                                 // which the audio worker takes on its hot path
+
+    if (usage_dirty) refresh_usage(&usage, have_usage);
 
     // Dim on a sustained idle; come straight back the moment anything happens.
     // ST_RECORDING never dims — the timer and level meter are the whole point of
@@ -487,12 +632,11 @@ static void render(lv_timer_t *t)
              s_battery_percent > 100 ? 100 : s_battery_percent);
     lv_label_set_text(s_battery, battery);
 
-    // The link symbol is the header's whole job: green when the PC is connected,
-    // dim when it is not. Colour, not a word, because it must be readable at a
-    // glance and there is only one font size.
-    lv_obj_set_style_text_color(s_title, lv_color_hex(
-        st == ST_CONNECTING ? UI_MUTED : st == ST_ERROR ? UI_RED : UI_GRASS), 0);
-    lv_obj_set_style_text_opa(s_title, st == ST_CONNECTING ? LV_OPA_40 : LV_OPA_COVER, 0);
+    uint32_t link_color = st == ST_CONNECTING ? DASH_MUTED :
+                          st == ST_ERROR ? UI_RED : DASH_SIGNAL;
+    lv_obj_set_style_bg_color(s_link_dot, lv_color_hex(link_color), 0);
+    lv_obj_set_style_text_opa(s_title,
+        st == ST_CONNECTING ? LV_OPA_50 : LV_OPA_COVER, 0);
 
     // Claude quota island: PC pushes used_percentage; the device has no synced
     // wall clock, so it shows remaining % only (no fabricated countdown).
@@ -502,76 +646,50 @@ static void render(lv_timer_t *t)
     // Pro/Max subscribers — so an unavailable figure shows as a dash. 未知 read as
     // a device fault for something the device never had.
     char cl[8], cx[8];
-    if (!have_q || q.remaining_pct < 0) snprintf(cl, sizeof(cl), "–");
+    if (!have_q || q.remaining_pct < 0) snprintf(cl, sizeof(cl), "--");
     else snprintf(cl, sizeof(cl), "%d%%", q.remaining_pct);
-    if (!have_q || q.codex_remaining_pct < 0) snprintf(cx, sizeof(cx), "–");
+    if (!have_q || q.codex_remaining_pct < 0) snprintf(cx, sizeof(cx), "--");
     else snprintf(cx, sizeof(cx), "%d%%", q.codex_remaining_pct);
-    lv_label_set_text_fmt(s_island, "Claude %s     Codex %s", cl, cx);
+    lv_label_set_text_fmt(s_island, "QUOTA  C %s  X %s", cl, cx);
 
-    // Mascot frame from state, and while recording from the capture level.
-    // Swapping the source invalidates all 160x160 px, which at a 240x20 draw
-    // buffer is 8 SPI flushes. That draw time comes straight out of the audio
-    // worker's frame budget on this single core, so the level bands get hysteresis:
-    // a voice hovering on a threshold otherwise re-swapped the image every render
-    // tick and cost ~6 points of delivered rate.
-    // Hysteresis on the level bands: a voice sitting on a threshold would otherwise
-    // re-swap the image every render tick. Throttling the swap rate on top of this
-    // was tried and reverted — it cost responsiveness and recovered no audio, which
-    // is how we know frame swaps are not the bottleneck.
-    int band = lvl > 70 ? 2 : lvl > 38 ? 1 : 0;
-    if (band == s_band + 1 && lvl < (s_band == 0 ? 46 : 78)) band = s_band;
-    if (band == s_band - 1 && lvl > (s_band == 2 ? 62 : 30)) band = s_band;
-    s_band = band;
-    const lv_image_dsc_t *want =
-        st == ST_CONNECTING ? &mascot_waiting :
-        st == ST_ERROR      ? &mascot_fault   :
-        st == ST_IDLE       ? &mascot_idle    :
-        band == 2           ? &mascot_peak    :
-        band == 1           ? &mascot_loud    : &mascot_quiet;
-    if (want != s_shown_frame) {
-        lv_image_set_src(s_mascot, want);
-        s_shown_frame = want;
+    if (s_drawn_state != (int)st) {
+        bool dashboard = st == ST_IDLE;
+        set_visible(s_usage_layer, dashboard);
+        set_visible(s_voice_layer, !dashboard);
+        s_drawn_state = st;
     }
 
     switch (st) {
     case ST_CONNECTING:
-        lv_label_set_text(s_big, "连接中");
-        lv_label_set_text(s_sub, "等待电脑蓝牙连接");
+        lv_label_set_text(s_big, "CONNECTING");
+        lv_label_set_text(s_sub, "WAITING FOR MAC");
         break;
     case ST_IDLE:
-        // The lit spark already says "ready"; a word under it would only repeat
-        // the picture.
-        lv_label_set_text(s_big, "");
-        lv_label_set_text(s_sub, "");
         break;
     case ST_RECORDING: {
-        char t2[40];
-        // Level bar as ASCII inside the existing label. Not new widgets: 12 extra
-        // lv_obj restyled per tick once tripped the task watchdog, which also
-        // froze every key (on_key waits on the LVGL lock). Not block glyphs
-        // either — 12 solid U+2588 cells redrawn at 10 Hz cost so much draw time
-        // that delivered audio fell to 23%. ASCII glyphs are mostly empty pixels.
-        int bars = s_level * 12 / 100;
-        char meter[13];
-        for (int i = 0; i < 12; i++) meter[i] = i < bars ? '=' : '.';
-        meter[12] = 0;
-        // Show elapsed time; append a warning if the BLE link is dropping frames
-        // (congested). A healthy link shows just the timer.
-        bool healthy = (tx == 0 || ok * 100 >= tx * 95);
-        snprintf(t2, sizeof(t2), healthy ? "%u.%us" : "%u.%us  信号弱",
-                 ms / 1000, ms % 1000 / 100);
-        // Stars already say "listening", so this row carries only the timer.
-        lv_label_set_text(s_big, "");
-        // Timer and level on one line, so the meter needs no widget of its own and
-        // the quota label keeps its place.
-        char line[64];   // t2 up to 40 + two spaces + 12 ASCII cells + NUL
-        snprintf(line, sizeof(line), "%s   %s", t2, meter);
-        lv_label_set_text(s_sub, line);
+        char time_text[16];
+        snprintf(time_text, sizeof(time_text), "%02u:%02u.%u",
+                 ms / 60000, ms / 1000 % 60, ms % 1000 / 100);
+        lv_label_set_text(s_big, time_text);
+
+        bool healthy = tx == 0 || ok * 100 >= tx * 95;
+        lv_label_set_text(s_sub, healthy ? "LISTENING" : "WEAK BLE LINK");
+        lv_obj_set_style_text_color(s_sub, lv_color_hex(
+            healthy ? DASH_MUTED : DASH_QUOTA), 0);
+
+        // One ASCII label, not 14 individually animated LVGL bars. The latter was
+        // measured to starve audio on this single-core/no-PSRAM target.
+        int bars = lvl * 14 / 100;
+        char meter[15];
+        for (int i = 0; i < 14; ++i) meter[i] = i < bars ? '=' : '.';
+        meter[14] = '\0';
+        lv_label_set_text(s_meter, meter);
         break;
     }
     case ST_ERROR:
-        lv_label_set_text(s_big, "故障");
-        lv_label_set_text(s_sub, "蓝牙或音频不可用");   // a fault needs its reason
+        lv_label_set_text(s_big, "ERROR");
+        lv_label_set_text(s_sub, "BLE / AUDIO UNAVAILABLE");
+        lv_obj_set_style_text_color(s_sub, lv_color_hex(UI_RED), 0);
         break;
     }
 }
@@ -589,63 +707,107 @@ void demo_voice_enter(void)
     s_closing = false;
     s_pending_ctrl = 0;
     s_battery_percent = -1;
+    s_battery_poll_ms = 0;
     s_have_quota = false;
+    s_have_usage = false;
+    s_usage_dirty = false;
+    s_drawn_state = -1;
+    memset(&s_usage, 0, sizeof(s_usage));
     s_lock = xSemaphoreCreateMutex();
     s_worker_done = xSemaphoreCreateBinary();
 
     s_scr = lv_obj_create(NULL);
-    lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *bg = lv_image_create(s_scr);
-    lv_image_set_src(bg, &backdrop);
-    lv_obj_align(bg, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_remove_flag(bg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(s_scr, lv_color_hex(DASH_VOID), 0);
     lv_obj_set_style_border_width(s_scr, 0, 0);
+    lv_obj_set_style_pad_all(s_scr, 0, 0);
 
-    s_title = lv_label_create(s_scr);
-    lv_label_set_text(s_title, LV_SYMBOL_BLUETOOTH);
-    lv_obj_set_style_text_font(s_title, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_title, lv_color_hex(UI_MUTED), 0);
-    lv_obj_align(s_title, LV_ALIGN_TOP_LEFT, 8, 13);
+    s_link_dot = dashboard_block(s_scr, 12, 17, 7, 7, DASH_MUTED, 4);
+    s_title = dashboard_label(s_scr, "AI PASSPORT", 26, 10,
+                              &lv_font_montserrat_14, DASH_PAPER);
+    dashboard_block(s_scr, 12, 39, 216, 1, DASH_LINE, 0);
 
-    s_battery = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_battery, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_battery, lv_color_hex(UI_MUTED), 0);
-    lv_obj_align(s_battery, LV_ALIGN_TOP_RIGHT, -8, 13);
+    s_battery = dashboard_label(s_scr, "--%", 184, 10,
+                                &lv_font_montserrat_14, DASH_MUTED);
+    lv_obj_set_width(s_battery, 44);
+    lv_obj_set_style_text_align(s_battery, LV_TEXT_ALIGN_RIGHT, 0);
 
-    // Claude quota island: a pill strip below the header.
-    s_island = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_island, &lv_font_ai_passport_14, 0);
-    // Quiet footer type, not a filled pill: quota is reference data, and a
-    // saturated block made the least important element the loudest one.
-    lv_obj_set_style_text_color(s_island, lv_color_hex(UI_MUTED), 0);
-    lv_obj_set_style_text_opa(s_island, LV_OPA_50, 0);
-    lv_obj_align(s_island, LV_ALIGN_TOP_MID, 0, 268);
-    lv_label_set_text(s_island, "Claude --");
+    lv_obj_t *primary = dashboard_block(s_scr, 12, 47, 216, 125,
+                                        DASH_SURFACE, 9);
+    lv_obj_set_style_border_width(primary, 1, 0);
+    lv_obj_set_style_border_color(primary, lv_color_hex(DASH_LINE), 0);
 
-    s_mascot = lv_image_create(s_scr);
-    lv_image_set_src(s_mascot, &mascot_idle);
-    lv_obj_align(s_mascot, LV_ALIGN_TOP_MID, 0, 50);
-    s_shown_frame = &mascot_idle;
-    s_band = 0;
+    s_usage_layer = dashboard_block(primary, 1, 1, 214, 123,
+                                    DASH_SURFACE, 8);
+    s_usage_kicker = dashboard_label(s_usage_layer, "TOKENS / LAST 24H", 10, 7,
+                                     &lv_font_montserrat_14, DASH_MUTED);
+    s_total = dashboard_label(s_usage_layer, "--", 10, 29,
+                              &lv_font_montserrat_20, DASH_PAPER);
+    s_peak = dashboard_label(s_usage_layer, "PC DATA --", 117, 32,
+                             &lv_font_montserrat_14, DASH_VOICE);
+    lv_obj_set_width(s_peak, 87);
+    lv_obj_set_style_text_align(s_peak, LV_TEXT_ALIGN_RIGHT, 0);
 
-    s_big = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_big, &lv_font_ai_passport_14, 0);
-    lv_obj_set_style_text_color(s_big, lv_color_hex(UI_YELLOW), 0);
-    lv_obj_set_style_text_align(s_big, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_align(s_big, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_line_space(s_big, 0, 0);
-    lv_obj_align(s_big, LV_ALIGN_TOP_MID, 0, 212);
+    // Twenty-four plain objects are cheaper than enabling LVGL's chart widget
+    // and give each local-hour bucket an exact pixel column on this 240 px UI.
+    for (size_t i = 0; i < ISLAND_USAGE_HOUR_COUNT; ++i) {
+        s_hour_bar[i] = dashboard_block(s_usage_layer, 10 + (int)i * 8,
+                                        101, 5, 0, DASH_BLUE, 2);
+    }
 
-    s_sub = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_sub, &lv_font_ai_passport_14, 0);
-    lv_obj_set_style_text_color(s_sub, lv_color_hex(UI_PAPER), 0);
-    lv_obj_set_style_text_align(s_sub, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_sub, LV_ALIGN_TOP_MID, 0, 234);
+    static const int axis_x[4] = {10, 69, 128, 188};
+    for (size_t i = 0; i < 4; ++i) {
+        s_axis[i] = dashboard_label(s_usage_layer, "--", axis_x[i], 104,
+                                    &lv_font_montserrat_14, DASH_MUTED);
+    }
+
+    s_voice_layer = dashboard_block(primary, 1, 1, 214, 123,
+                                    DASH_SURFACE, 8);
+    dashboard_label(s_voice_layer, "VOICE INPUT / RIGHT CMD", 10, 7,
+                    &lv_font_montserrat_14, DASH_VOICE);
+    s_big = dashboard_label(s_voice_layer, "CONNECTING", 10, 34,
+                            &lv_font_montserrat_20, DASH_PAPER);
+    s_sub = dashboard_label(s_voice_layer, "WAITING FOR MAC", 10, 61,
+                            &lv_font_montserrat_14, DASH_MUTED);
+    s_meter = dashboard_label(s_voice_layer, "..............", 10, 91,
+                              &lv_font_montserrat_14, DASH_VOICE);
+
+    lv_obj_t *models = dashboard_block(s_scr, 12, 179, 216, 96,
+                                       DASH_SURFACE, 8);
+    lv_obj_set_style_border_width(models, 1, 0);
+    lv_obj_set_style_border_color(models, lv_color_hex(DASH_LINE), 0);
+    static const uint32_t model_colors[ISLAND_USAGE_MODEL_COUNT] = {
+        DASH_VOICE, DASH_QUOTA, DASH_SIGNAL,
+    };
+    for (size_t i = 0; i < ISLAND_USAGE_MODEL_COUNT; ++i) {
+        int y = 5 + (int)i * 30;
+        s_model_dot[i] = dashboard_block(models, 10, y + 4, 7, 7,
+                                         model_colors[i], 2);
+        s_model_name[i] = dashboard_label(models, "--", 25, y,
+                                          &lv_font_montserrat_14, DASH_PAPER);
+        lv_obj_set_width(s_model_name[i], 115);
+        lv_label_set_long_mode(s_model_name[i], LV_LABEL_LONG_CLIP);
+        s_model_value[i] = dashboard_label(models, "--", 142, y,
+                                           &lv_font_montserrat_14, DASH_PAPER);
+        lv_obj_set_width(s_model_value[i], 64);
+        lv_obj_set_style_text_align(s_model_value[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_t *track = dashboard_block(models, 25, y + 19, 174, 3,
+                                          0x202322, 2);
+        s_model_bar[i] = dashboard_block(track, 0, 0, 0, 3,
+                                         model_colors[i], 2);
+    }
+
+    s_island = dashboard_label(s_scr, "QUOTA  C --  X --", 14, 287,
+                               &lv_font_montserrat_14, DASH_MUTED);
+    set_visible(s_usage_layer, false);
+    set_visible(s_voice_layer, true);
+    refresh_usage(&s_usage, false);
 
     lv_screen_load(s_scr);
 
     if (s_lock == NULL || s_worker_done == NULL) {
-        lv_label_set_text(s_sub, "内存不足，请重启设备");
+        lv_label_set_text(s_big, "MEMORY ERROR");
+        lv_label_set_text(s_sub, "RESTART DEVICE");
         return;
     }
     s_timer = lv_timer_create(render, VOICE_TICK_MS, NULL);

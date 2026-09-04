@@ -15,6 +15,7 @@ idf_component_register(
          "mascot_peak.c"
          "mascot_fault.c"
          "island_quota.c"
+         "island_usage.c"
          "feishu_binding.c"
          "feishu_api.c"
          "feishu_asr.c"

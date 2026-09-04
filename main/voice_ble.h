@@ -1,9 +1,9 @@
 #pragma once
 
 // BLE GATT peripheral for voice: advertises "AI-Passport-Mic", exposes one
-// service with an audio characteristic (notify, raw 16 kHz PCM frames) and a
-// control characteristic (notify + write, one byte). The PC client
-// client (tools/island_agent.py recv-ble) subscribes to both.
+// service with an audio characteristic (notify, 16 kHz mu-law frames) and a
+// bidirectional control characteristic (notify control/stats, write telemetry).
+// The PC client (tools/island_agent.py recv-ble) subscribes to both.
 //
 // Threading: init/start/stop are called from the voice worker task. Sending is
 // non-blocking — audio frames are dropped if no client is subscribed or the
@@ -26,7 +26,7 @@ bool voice_ble_ready(void);
 // NimBLE submissions.
 uint16_t voice_ble_next_audio_seq(void);
 
-// Queue one raw PCM audio frame with its captured-frame sequence number.
+// Queue one mu-law audio frame with its captured-frame sequence number.
 // Non-blocking; returns false if NimBLE cannot accept the frame.
 bool voice_ble_send_audio(const uint8_t *data, size_t len, uint16_t seq);
 
@@ -65,8 +65,9 @@ bool voice_ble_send_ctrl(uint8_t code);
 // as the one-byte codes; the first byte identifies which.
 bool voice_ble_send_ctrl_buf(const uint8_t *data, size_t len);
 
-// Register a sink for quota packets the PC writes to the control characteristic
-// (7-byte island_quota wire format). Called from the BLE host task — the sink
-// must be cheap and thread-safe. Pass NULL to clear.
-typedef void (*voice_ble_quota_cb_t)(const uint8_t *data, size_t len);
-void voice_ble_set_quota_cb(voice_ble_quota_cb_t cb);
+// Register a sink for PC -> device telemetry written to the control
+// characteristic (quota and usage-dashboard packets). Called from the NimBLE
+// host task, so the sink must only validate/copy and remain thread-safe. Pass
+// NULL before stopping BLE or deleting the receiving page.
+typedef void (*voice_ble_data_cb_t)(const uint8_t *data, size_t len);
+void voice_ble_set_data_cb(voice_ble_data_cb_t cb);
