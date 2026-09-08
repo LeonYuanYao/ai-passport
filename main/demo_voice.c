@@ -554,9 +554,15 @@ static void set_visible(lv_obj_t *obj, bool visible)
 
 static void format_tokens(char *dst, size_t size, uint32_t tokens_10k)
 {
-    if (tokens_10k >= 100) {
-        snprintf(dst, size, "%u.%uM", (unsigned)(tokens_10k / 100),
-                 (unsigned)(tokens_10k % 100 / 10));
+    // Promote before rounding would display 1000.0M; match the HTML preview.
+    if (tokens_10k >= 99995) {
+        uint32_t hundredths = tokens_10k / 1000 + (tokens_10k % 1000 >= 500);
+        snprintf(dst, size, "%u.%02uB", (unsigned)(hundredths / 100),
+                 (unsigned)(hundredths % 100));
+    } else if (tokens_10k >= 100) {
+        uint32_t tenths = (tokens_10k + 5) / 10;
+        snprintf(dst, size, "%u.%uM", (unsigned)(tenths / 10),
+                 (unsigned)(tenths % 10));
     } else if (tokens_10k > 0) {
         snprintf(dst, size, "%uK", (unsigned)(tokens_10k * 10));
     } else {
