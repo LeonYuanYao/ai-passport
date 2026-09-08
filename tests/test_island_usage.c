@@ -25,6 +25,14 @@ static void seal(uint8_t packet[ISLAND_USAGE_PACKET_LEN])
     }
 }
 
+static void seal_week(uint8_t packet[ISLAND_USAGE_WEEK_PACKET_LEN])
+{
+    packet[ISLAND_USAGE_WEEK_PACKET_LEN - 1] = 0;
+    for (size_t i = 0; i + 1 < ISLAND_USAGE_WEEK_PACKET_LEN; ++i) {
+        packet[ISLAND_USAGE_WEEK_PACKET_LEN - 1] ^= packet[i];
+    }
+}
+
 static void make_packet(uint8_t packet[ISLAND_USAGE_PACKET_LEN])
 {
     memset(packet, 0, ISLAND_USAGE_PACKET_LEN);
@@ -101,10 +109,53 @@ static void test_bar_height(void)
     assert(island_usage_bar_height(10, 0, 39) == 0);
 }
 
+static void test_parse_week_snapshot(void)
+{
+    uint8_t packet[ISLAND_USAGE_WEEK_PACKET_LEN] = {0};
+    packet[0] = ISLAND_USAGE_WEEK_MAGIC;
+    packet[1] = ISLAND_USAGE_WEEK_VERSION;
+    packet[2] = 5;  // Saturday, where Monday == 0
+    packet[3] = 3;
+    put_u32(packet + ISLAND_USAGE_WEEK_TOTAL_OFFSET, 370300);
+    put_u32(packet + ISLAND_USAGE_WEEK_DAYS_OFFSET + 0 * 4, 31240);
+    put_u32(packet + ISLAND_USAGE_WEEK_DAYS_OFFSET + 4 * 4, 72860);
+    put_u32(packet + ISLAND_USAGE_WEEK_DAYS_OFFSET + 6 * 4, 64460);
+
+    uint8_t *model = packet + ISLAND_USAGE_WEEK_MODELS_OFFSET;
+    memcpy(model, "GPT-5.6-SOL", 11);
+    put_u32(model + ISLAND_USAGE_MODEL_NAME_LEN, 222000);
+    model += ISLAND_USAGE_MODEL_SLOT_LEN;
+    memcpy(model, "GPT-5.5", 7);
+    put_u32(model + ISLAND_USAGE_MODEL_NAME_LEN, 126000);
+    model += ISLAND_USAGE_MODEL_SLOT_LEN;
+    memcpy(model, "OPUS-5", 6);
+    put_u32(model + ISLAND_USAGE_MODEL_NAME_LEN, 22300);
+    seal_week(packet);
+
+    island_usage_week_t usage = {0};
+    assert(island_usage_week_parse(packet, sizeof(packet), &usage));
+    assert(usage.start_weekday == 5);
+    assert(usage.model_count == 3);
+    assert(usage.total_10k == 370300);
+    assert(usage.daily_10k[0] == 31240);
+    assert(usage.daily_10k[4] == 72860);
+    assert(usage.daily_10k[6] == 64460);
+    assert(strcmp(usage.models[0].name, "GPT-5.6-SOL") == 0);
+    assert(usage.models[0].tokens_10k == 222000);
+    assert(strcmp(usage.models[2].name, "OPUS-5") == 0);
+    assert(usage.models[2].tokens_10k == 22300);
+
+    assert(island_usage_next_range(ISLAND_USAGE_RANGE_DAY) ==
+           ISLAND_USAGE_RANGE_WEEK);
+    assert(island_usage_next_range(ISLAND_USAGE_RANGE_WEEK) ==
+           ISLAND_USAGE_RANGE_DAY);
+}
+
 int main(void)
 {
     test_parse_snapshot();
     test_rejects_without_clobbering();
     test_bar_height();
+    test_parse_week_snapshot();
     return 0;
 }

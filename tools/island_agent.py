@@ -20,9 +20,9 @@ Two unrelated jobs share this file because they share the device link:
      normal statusline AND writes the packet the device parses; `send` forwards it
      over USB-serial. recv-ble also pushes it over BLE between takes, which is how
      it actually reaches the device in normal use. The BLE agent also aggregates
-     the last 24 hours of local Codex/Claude usage metadata into hourly buckets
-     and top-model totals, then pushes a compact snapshot every five minutes. It never
-     sends prompt or response text. Claude Code only sends
+     the last seven days of local Codex/Claude usage metadata into hourly and
+     daily buckets plus top-model totals, then pushes two compact snapshots every
+     five minutes. It never sends prompt or response text. Claude Code only sends
      rate_limits to Pro/Max subscribers, so on a plain API key it emits the
      "unknown" packet and the device shows 未知 rather than a stale ring.
 
@@ -55,6 +55,10 @@ USAGE_HOURS = 24
 USAGE_MODELS = 3
 USAGE_MODEL_NAME_LEN = 12
 USAGE_LEN = 105
+USAGE_WEEK_MAGIC = 0x57
+USAGE_WEEK_VERSION = 1
+USAGE_WEEK_DAYS = 7
+USAGE_WEEK_LEN = 85
 
 # Device audio frame: 480 mu-law bytes, 30 ms at 16 kHz. Kept here rather than
 # inside cmd_recv_ble so selftest can assert it against the device's own figure.
@@ -233,7 +237,7 @@ def _claude_message_tokens(usage):
 
 
 def collect_usage_snapshot(now=None, codex_paths=None, claude_paths=None):
-    """Aggregate local Codex and Claude metadata into 24 hourly buckets.
+    """Aggregate local Codex and Claude metadata into day and week windows.
 
     Only timestamps, model identifiers, and usage counters are inspected. Codex
     emits cumulative per-session totals, so deltas are attributed to the active
@@ -244,30 +248,38 @@ def collect_usage_snapshot(now=None, codex_paths=None, claude_paths=None):
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
-    start = current_hour - dt.timedelta(hours=USAGE_HOURS - 1)
+    day_start = current_hour - dt.timedelta(hours=USAGE_HOURS - 1)
+    current_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = current_day - dt.timedelta(days=6)
     end = current_hour + dt.timedelta(hours=1)
 
     if codex_paths is None:
         codex_paths = _recent_paths(
-            "~/.codex/sessions/*/*/*/rollout-*.jsonl", start)
+            "~/.codex/sessions/*/*/*/rollout-*.jsonl", week_start)
     if claude_paths is None:
-        claude_paths = _recent_paths("~/.claude/projects/**/*.jsonl", start)
+        claude_paths = _recent_paths("~/.claude/projects/**/*.jsonl", week_start)
 
     hourly = [0] * USAGE_HOURS
+    daily = [0] * 7
     by_model = {}
+    week_by_model = {}
 
     def add(timestamp, model, tokens):
         if timestamp is None or tokens <= 0:
             return
         local = timestamp.astimezone(now.tzinfo)
-        if local < start or local >= end:
-            return
-        bucket = int((local - start).total_seconds() // 3600)
-        if not 0 <= bucket < USAGE_HOURS:
+        if local < week_start or local >= end:
             return
         name = model if isinstance(model, str) and model else "unknown"
-        hourly[bucket] += tokens
-        by_model[name] = by_model.get(name, 0) + tokens
+        day_bucket = (local.date() - week_start.date()).days
+        if 0 <= day_bucket < len(daily):
+            daily[day_bucket] += tokens
+            week_by_model[name] = week_by_model.get(name, 0) + tokens
+        if local >= day_start:
+            hour_bucket = int((local - day_start).total_seconds() // 3600)
+            if 0 <= hour_bucket < USAGE_HOURS:
+                hourly[hour_bucket] += tokens
+                by_model[name] = by_model.get(name, 0) + tokens
 
     for path in codex_paths:
         active_model = "codex"
@@ -330,11 +342,17 @@ def collect_usage_snapshot(now=None, codex_paths=None, claude_paths=None):
         add(timestamp, model, tokens)
 
     models = sorted(by_model.items(), key=lambda item: (-item[1], item[0]))
+    week_models = sorted(week_by_model.items(),
+                         key=lambda item: (-item[1], item[0]))
     return {
-        "start_hour": start.hour,
+        "start_hour": day_start.hour,
         "total": sum(hourly),
         "hourly": hourly,
         "models": models[:USAGE_MODELS],
+        "start_weekday": week_start.weekday(),
+        "week_total": sum(daily),
+        "daily": daily,
+        "week_models": week_models[:USAGE_MODELS],
     }
 
 
@@ -379,8 +397,41 @@ def pack_usage(snapshot):
     return bytes(body) + bytes([checksum])
 
 
+def pack_week_usage(snapshot):
+    """Pack a seven-day usage snapshot into the fixed 85-byte wire format."""
+    daily = snapshot.get("daily")
+    if not isinstance(daily, list) or len(daily) != USAGE_WEEK_DAYS:
+        raise ValueError("usage snapshot must contain 7 daily buckets")
+    models = snapshot.get("week_models") or []
+    body = bytearray(USAGE_WEEK_LEN - 1)
+    body[0] = USAGE_WEEK_MAGIC
+    body[1] = USAGE_WEEK_VERSION
+    body[2] = max(0, min(6, int(snapshot.get("start_weekday", 0))))
+    body[3] = min(USAGE_MODELS, len(models))
+    struct.pack_into("<I", body, 4,
+                     _tokens_to_10k(snapshot.get("week_total", 0), 0xffffffff))
+    for index, tokens in enumerate(daily):
+        struct.pack_into("<I", body, 8 + index * 4,
+                         _tokens_to_10k(tokens, 0xffffffff))
+    for index, (model, tokens) in enumerate(models[:USAGE_MODELS]):
+        offset = 36 + index * 16
+        name = _usage_model_label(model)
+        body[offset:offset + len(name)] = name
+        struct.pack_into("<I", body, offset + USAGE_MODEL_NAME_LEN,
+                         _tokens_to_10k(tokens, 0xffffffff))
+    checksum = 0
+    for value in body:
+        checksum ^= value
+    return bytes(body) + bytes([checksum])
+
+
 def build_usage_packet():
     return pack_usage(collect_usage_snapshot())
+
+
+def build_usage_packets():
+    snapshot = collect_usage_snapshot()
+    return pack_usage(snapshot), pack_week_usage(snapshot)
 
 
 def cmd_statusline(args):
@@ -1158,13 +1209,14 @@ def cmd_recv_ble(args):
                 # daemon whose primary job is low-latency microphone forwarding.
                 if tick % 150 == 0 and not held[0]:  # 150 * 2 s = 5 min
                     try:
-                        usage = await asyncio.to_thread(build_usage_packet)
+                        usage = await asyncio.to_thread(build_usage_packets)
                     except (OSError, ValueError) as e:
                         print(f"island: usage snapshot failed: {e}", file=sys.stderr)
                         usage = None
                     if usage and usage != last_usage:
-                        await client.write_gatt_char(BLE_UUID_CTRL, usage,
-                                                     response=False)
+                        for packet in usage:
+                            await client.write_gatt_char(BLE_UUID_CTRL, packet,
+                                                         response=False)
                         last_usage = usage
                 # Watchdog: the key is only legitimately held while audio flows. If
                 # it is held but nothing has arrived for 20 s the link is gone and
@@ -1329,6 +1381,13 @@ def cmd_selftest(_args):
             for row in rows:
                 f.write(json.dumps(row) + "\n")
         with open(claude_path, "w") as f:
+            old = {"type": "assistant", "timestamp": "2026-09-01T04:00:00Z",
+                   "message": {"id": "msg_week", "model": "claude-sonnet-5",
+                               "usage": {"input_tokens": 70000,
+                                         "cache_creation_input_tokens": 0,
+                                         "cache_read_input_tokens": 0,
+                                         "output_tokens": 0}}}
+            f.write(json.dumps(old) + "\n")
             base = {"type": "assistant", "timestamp": "2026-09-04T05:05:00Z",
                     "message": {"id": "msg_test", "model": "claude-opus-5",
                                 "usage": {"input_tokens": 2,
@@ -1349,6 +1408,14 @@ def cmd_selftest(_args):
             ("claude-opus-5", 60000),
             ("gpt-5.5", 50000),
         ], snap["models"]
+        assert snap["week_total"] == 430000, snap
+        assert snap["daily"][3] == 70000, snap["daily"]   # Tuesday
+        assert snap["daily"][6] == 360000, snap["daily"]  # Friday
+        assert snap["week_models"] == [
+            ("gpt-5.6-sol", 250000),
+            ("claude-sonnet-5", 70000),
+            ("claude-opus-5", 60000),
+        ], snap["week_models"]
 
     fixture = {
         "start_hour": 16,
@@ -1369,6 +1436,27 @@ def cmd_selftest(_args):
     assert u[88:100].rstrip(b"\0") == b"OPUS-5"
     fold = 0
     for b in u:
+        fold ^= b
+    assert fold == 0
+
+    week_fixture = {
+        "start_weekday": 5,
+        "week_total": 3703000000,
+        "daily": [312400000, 480800000, 395100000, 601200000,
+                  728600000, 540300000, 644600000],
+        "week_models": [("gpt-5.6-sol", 2220000000),
+                        ("gpt-5.5", 1260000000),
+                        ("claude-opus-5", 223000000)],
+    }
+    w = pack_week_usage(week_fixture)
+    assert len(w) == 85 and w[0] == 0x57 and w[1] == 1
+    assert w[2] == 5 and w[3] == 3
+    assert struct.unpack_from("<I", w, 4)[0] == 370300
+    assert struct.unpack_from("<I", w, 8)[0] == 31240
+    assert struct.unpack_from("<I", w, 8 + 6 * 4)[0] == 64460
+    assert w[36:48].rstrip(b"\0") == b"GPT-5.6-SOL"
+    fold = 0
+    for b in w:
         fold ^= b
     assert fold == 0
 

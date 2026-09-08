@@ -62,12 +62,13 @@ typedef enum { ST_CONNECTING, ST_IDLE, ST_RECORDING, ST_ERROR } voice_state_t;
 
 static lv_obj_t *s_scr;
 static lv_obj_t *s_title;
-static lv_obj_t *s_link_dot;
-static lv_obj_t *s_link_state;
+static lv_obj_t *s_link_icon;
 static lv_obj_t *s_big;
 static lv_obj_t *s_sub;
 static lv_obj_t *s_battery;
-static lv_obj_t *s_island;
+static lv_obj_t *s_battery_shell;
+static lv_obj_t *s_battery_fill;
+static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_usage_kicker;
 static lv_obj_t *s_usage_layer;
 static lv_obj_t *s_voice_layer;
@@ -80,6 +81,10 @@ static lv_obj_t *s_model_name[ISLAND_USAGE_MODEL_COUNT];
 static lv_obj_t *s_model_value[ISLAND_USAGE_MODEL_COUNT];
 static lv_obj_t *s_model_bar[ISLAND_USAGE_MODEL_COUNT];
 static lv_obj_t *s_model_dot[ISLAND_USAGE_MODEL_COUNT];
+static lv_obj_t *s_range_bg[2];
+static lv_obj_t *s_range_label[2];
+static lv_obj_t *s_quota_value;
+static lv_obj_t *s_quota_bar;
 static lv_timer_t *s_timer;
 
 static SemaphoreHandle_t s_lock;
@@ -122,9 +127,13 @@ static island_quota_t s_quota;
 static bool s_have_quota;
 static island_usage_t s_usage;
 static bool s_have_usage;
+static island_usage_week_t s_usage_week;
+static bool s_have_usage_week;
+static island_usage_range_t s_usage_range;
 static bool s_usage_dirty;
-static bool s_ever_linked;
 static int s_drawn_state = -1;
+static int s_drawn_quota = -2;
+static int s_drawn_battery = -2;
 static unsigned s_battery_poll_ms;
 
 // Integer square root, bit-by-bit restoring. Keeps float sqrt out of the audio
@@ -145,7 +154,6 @@ static void set_state(voice_state_t st)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_state = st;
-    if (st == ST_IDLE || st == ST_RECORDING) s_ever_linked = true;
     xSemaphoreGive(s_lock);
 }
 
@@ -156,17 +164,24 @@ static void on_telemetry(const uint8_t *data, size_t len)
 {
     island_quota_t q;
     island_usage_t usage;
+    island_usage_week_t week;
     bool is_quota = island_quota_parse(data, len, &q);
     bool is_usage = !is_quota && island_usage_parse(data, len, &usage);
-    if ((!is_quota && !is_usage) || s_lock == NULL) return;
+    bool is_week = !is_quota && !is_usage &&
+                   island_usage_week_parse(data, len, &week);
+    if ((!is_quota && !is_usage && !is_week) || s_lock == NULL) return;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (is_quota) {
         s_quota = q;
         s_have_quota = true;
-    } else {
+    } else if (is_usage) {
         s_usage = usage;
         s_have_usage = true;
+        s_usage_dirty = true;
+    } else {
+        s_usage_week = week;
+        s_have_usage_week = true;
         s_usage_dirty = true;
     }
     xSemaphoreGive(s_lock);
@@ -465,6 +480,12 @@ void demo_voice_wake(void)
 #define DASH_SIGNAL   0x76D8A0
 #define DASH_QUOTA    0xF3C36B
 #define DASH_BLUE     0x79A8E8
+#define DASH_BATTERY  0xA6AAA8
+#define QUOTA_TRACK_WIDTH 112
+#define HEADER_RIGHT_MARGIN 12
+#define HEADER_LINK_GAP 4
+#define HEADER_BATTERY_TEXT_GAP 3
+#define BATTERY_INNER_WIDTH 16
 
 static lv_obj_t *dashboard_block(lv_obj_t *parent, int x, int y, int w, int h,
                                  uint32_t color, int radius)
@@ -491,6 +512,40 @@ static lv_obj_t *dashboard_label(lv_obj_t *parent, const char *text, int x, int 
     return label;
 }
 
+static void refresh_header_battery(void)
+{
+    int shown = s_battery_percent > 100 ? 100 : s_battery_percent;
+    if (shown == s_drawn_battery) return;
+
+    if (shown < 0) lv_label_set_text(s_battery, "--%");
+    else lv_label_set_text_fmt(s_battery, "%d%%", shown);
+
+    uint32_t color = DASH_BATTERY;
+    int fill_width = 0;
+    if (shown >= 0) {
+        if (shown <= 20) color = UI_RED;
+        else if (shown <= 40) color = DASH_QUOTA;
+        fill_width = (shown * BATTERY_INNER_WIDTH + 99) / 100;
+        if (fill_width > BATTERY_INNER_WIDTH) fill_width = BATTERY_INNER_WIDTH;
+    }
+    lv_obj_set_width(s_battery_fill, fill_width);
+    lv_obj_set_style_bg_color(s_battery_fill, lv_color_hex(color), 0);
+    lv_obj_set_style_border_color(s_battery_shell, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_color(s_battery_cap, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(s_battery, lv_color_hex(color), 0);
+
+    // Right-align the complete status cluster. The percentage is auto-sized, so
+    // chaining align_to() keeps 9%, 82%, and 100% equally compact. The four-pixel
+    // Bluetooth gap is intentional; two pixels looked visually fused on-panel.
+    lv_obj_align(s_battery_cap, LV_ALIGN_TOP_RIGHT, -HEADER_RIGHT_MARGIN, 15);
+    lv_obj_align_to(s_battery_shell, s_battery_cap, LV_ALIGN_OUT_LEFT_MID, -1, 0);
+    lv_obj_align_to(s_battery, s_battery_shell, LV_ALIGN_OUT_LEFT_MID,
+                    -HEADER_BATTERY_TEXT_GAP, 0);
+    lv_obj_align_to(s_link_icon, s_battery, LV_ALIGN_OUT_LEFT_MID,
+                    -HEADER_LINK_GAP, 0);
+    s_drawn_battery = shown;
+}
+
 static void set_visible(lv_obj_t *obj, bool visible)
 {
     if (visible) lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
@@ -509,21 +564,46 @@ static void format_tokens(char *dst, size_t size, uint32_t tokens_10k)
     }
 }
 
-// Usage objects are restyled only when a new five-minute PC snapshot
-// arrives. They never participate in the 10 Hz recording redraw hot path.
-static void refresh_usage(const island_usage_t *usage, bool have_usage)
+static void refresh_range_tabs(island_usage_range_t range)
+{
+    for (size_t i = 0; i < 2; ++i) {
+        bool active = i == (size_t)range;
+        lv_obj_set_style_bg_color(s_range_bg[i],
+                                  lv_color_hex(active ? DASH_LINE : DASH_SURFACE), 0);
+        lv_obj_set_style_text_color(s_range_label[i],
+                                    lv_color_hex(active ? DASH_PAPER : DASH_MUTED), 0);
+    }
+}
+
+// Usage objects are restyled only when a new five-minute PC snapshot arrives
+// or the user changes range. They never enter the 10 Hz recording redraw path.
+static void refresh_usage(const island_usage_t *usage, bool have_usage,
+                          const island_usage_week_t *week, bool have_week,
+                          island_usage_range_t range)
 {
     static const uint32_t colors[ISLAND_USAGE_MODEL_COUNT] = {
         DASH_VOICE, DASH_QUOTA, DASH_SIGNAL,
     };
+    static const char *const weekday[ISLAND_USAGE_DAY_COUNT] = {
+        "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN",
+    };
     char text[24];
-    uint16_t peak = 0;
+    uint32_t peak = 0;
+    bool weekly = range == ISLAND_USAGE_RANGE_WEEK;
+    bool have_selected = weekly ? have_week : have_usage;
+    uint32_t total = weekly ? week->total_10k : usage->total_10k;
+    uint8_t model_count = weekly ? week->model_count : usage->model_count;
+    const island_usage_model_t *models = weekly ? week->models : usage->models;
 
-    if (have_usage) {
-        format_tokens(text, sizeof(text), usage->total_10k);
+    refresh_range_tabs(range);
+
+    if (have_selected) {
+        format_tokens(text, sizeof(text), total);
         lv_label_set_text(s_total, text);
-        for (size_t i = 0; i < ISLAND_USAGE_HOUR_COUNT; ++i) {
-            if (usage->hourly_10k[i] > peak) peak = usage->hourly_10k[i];
+        size_t bucket_count = weekly ? ISLAND_USAGE_DAY_COUNT : ISLAND_USAGE_HOUR_COUNT;
+        for (size_t i = 0; i < bucket_count; ++i) {
+            uint32_t value = weekly ? week->daily_10k[i] : usage->hourly_10k[i];
+            if (value > peak) peak = value;
         }
         char peak_text[16];
         format_tokens(peak_text, sizeof(peak_text), peak);
@@ -535,29 +615,39 @@ static void refresh_usage(const island_usage_t *usage, bool have_usage)
     }
 
     for (size_t i = 0; i < ISLAND_USAGE_HOUR_COUNT; ++i) {
-        int height = have_usage ? island_usage_bar_height(
-            usage->hourly_10k[i], peak, 43) : 0;
+        bool visible = !weekly || i < ISLAND_USAGE_DAY_COUNT;
+        uint32_t value = weekly && i < ISLAND_USAGE_DAY_COUNT
+            ? week->daily_10k[i] : usage->hourly_10k[i];
+        int height = have_selected && visible
+            ? island_usage_bar_height(value, peak, 43) : 0;
+        set_visible(s_hour_bar[i], visible);
+        lv_obj_set_x(s_hour_bar[i], weekly ? 10 + (int)i * 28 : 10 + (int)i * 8);
+        lv_obj_set_width(s_hour_bar[i], weekly ? 23 : 5);
         lv_obj_set_y(s_hour_bar[i], 58 + 43 - height);
         lv_obj_set_height(s_hour_bar[i], height);
     }
 
     for (size_t i = 0; i < 4; ++i) {
-        unsigned hour = have_usage ? (usage->start_hour + i * 6) % 24 : i * 6;
-        snprintf(text, sizeof(text), "%02u", hour);
+        if (weekly) {
+            unsigned day = (week->start_weekday + i * 2) % ISLAND_USAGE_DAY_COUNT;
+            snprintf(text, sizeof(text), "%s", weekday[day]);
+        } else {
+            unsigned hour = have_usage ? (usage->start_hour + i * 6) % 24 : i * 6;
+            snprintf(text, sizeof(text), "%02u", hour);
+        }
         lv_label_set_text(s_axis[i], text);
     }
 
     for (size_t i = 0; i < ISLAND_USAGE_MODEL_COUNT; ++i) {
-        bool present = have_usage && i < usage->model_count;
-        lv_label_set_text(s_model_name[i], present ? usage->models[i].name : "--");
-        format_tokens(text, sizeof(text), present ? usage->models[i].tokens_10k : 0);
+        bool present = have_selected && i < model_count;
+        lv_label_set_text(s_model_name[i], present ? models[i].name : "--");
+        format_tokens(text, sizeof(text), present ? models[i].tokens_10k : 0);
         lv_label_set_text(s_model_value[i], text);
         uint32_t width = 0;
-        if (present && usage->total_10k > 0) {
-            width = (uint32_t)((uint64_t)usage->models[i].tokens_10k * 174 /
-                               usage->total_10k);
+        if (present && total > 0) {
+            width = (uint32_t)((uint64_t)models[i].tokens_10k * 174 / total);
             if (width > 174) width = 174;
-            if (width == 0 && usage->models[i].tokens_10k > 0) width = 2;
+            if (width == 0 && models[i].tokens_10k > 0) width = 2;
         }
         lv_obj_set_width(s_model_bar[i], width);
         lv_obj_set_style_bg_color(s_model_dot[i], lv_color_hex(colors[i]), 0);
@@ -597,15 +687,18 @@ static void render(lv_timer_t *t)
     bool have_q = s_have_quota;
     island_quota_t q = s_quota;
     bool have_usage = s_have_usage;
+    bool have_week = s_have_usage_week;
     bool usage_dirty = s_usage_dirty;
-    bool ever_linked = s_ever_linked;
     island_usage_t usage = s_usage;
+    island_usage_week_t week = s_usage_week;
     s_usage_dirty = false;
     xSemaphoreGive(s_lock);
     int lvl = s_level;          // plain volatile: deliberately not under s_lock,
                                 // which the audio worker takes on its hot path
 
-    if (usage_dirty) refresh_usage(&usage, have_usage);
+    if (usage_dirty) {
+        refresh_usage(&usage, have_usage, &week, have_week, s_usage_range);
+    }
 
     // Dim on a sustained idle; come straight back the moment anything happens.
     // ST_RECORDING never dims — the timer and level meter are the whole point of
@@ -631,36 +724,32 @@ static void render(lv_timer_t *t)
         demo_voice_wake();      // recording: full brightness, dwell reset
     }
 
-    char battery[8];
-    snprintf(battery, sizeof(battery), s_battery_percent >= 0 ? "%d%%" : "--%%",
-             s_battery_percent > 100 ? 100 : s_battery_percent);
-    lv_label_set_text(s_battery, battery);
+    refresh_header_battery();
 
-    uint32_t link_color = st == ST_CONNECTING ? DASH_MUTED :
-                          st == ST_ERROR ? UI_RED : DASH_SIGNAL;
-    lv_obj_set_style_bg_color(s_link_dot, lv_color_hex(link_color), 0);
-    const char *link_text = st == ST_ERROR ? "连接错误" :
-                            st == ST_CONNECTING ?
-                                (ever_linked ? "连接丢失" : "连接中") :
-                                "已连接";
-    lv_label_set_text(s_link_state, link_text);
-    lv_obj_set_style_text_color(s_link_state, lv_color_hex(link_color), 0);
+    bool linked = st == ST_IDLE || st == ST_RECORDING;
+    lv_obj_set_style_text_color(s_link_icon,
+                                lv_color_hex(linked ? DASH_SIGNAL : DASH_MUTED), 0);
     lv_obj_set_style_text_opa(s_title,
         st == ST_CONNECTING ? LV_OPA_50 : LV_OPA_COVER, 0);
 
-    // Claude quota island: PC pushes used_percentage; the device has no synced
-    // wall clock, so it shows remaining % only (no fabricated countdown).
-    // Both quotas on the island, each showing remaining %. The device has no
-    // synced wall clock, so no countdown is fabricated.
-    // Claude's number is often absent — Claude Code only publishes rate_limits to
-    // Pro/Max subscribers — so an unavailable figure shows as a dash. 未知 read as
-    // a device fault for something the device never had.
-    char cl[8], cx[8];
-    if (!have_q || q.remaining_pct < 0) snprintf(cl, sizeof(cl), "--");
-    else snprintf(cl, sizeof(cl), "%d%%", q.remaining_pct);
-    if (!have_q || q.codex_remaining_pct < 0) snprintf(cx, sizeof(cx), "--");
-    else snprintf(cx, sizeof(cx), "%d%%", q.codex_remaining_pct);
-    lv_label_set_text_fmt(s_island, "CLAUDE %s  CODEX %s", cl, cx);
+    // Only Codex's seven-day remaining quota is part of this dashboard. Keep the
+    // numeric value beside its track: the bar gives an at-a-glance warning while
+    // the number remains useful near the limit. An unavailable value is an empty
+    // track plus "--", not a fabricated zero. Restyle only when telemetry changes
+    // so the 10 Hz recording render path does not invalidate these widgets.
+    int remaining = have_q ? q.codex_remaining_pct : -1;
+    if (remaining != s_drawn_quota) {
+        if (remaining < 0) {
+            lv_label_set_text(s_quota_value, "--");
+            lv_obj_set_width(s_quota_bar, 0);
+        } else {
+            lv_label_set_text_fmt(s_quota_value, "%d%%", remaining);
+            int width = (remaining * QUOTA_TRACK_WIDTH + 50) / 100;
+            if (width == 0 && remaining > 0) width = 1;
+            lv_obj_set_width(s_quota_bar, width);
+        }
+        s_drawn_quota = remaining;
+    }
 
     if (s_drawn_state != (int)st) {
         bool dashboard = st == ST_IDLE;
@@ -720,10 +809,14 @@ void demo_voice_enter(void)
     s_battery_poll_ms = 0;
     s_have_quota = false;
     s_have_usage = false;
+    s_have_usage_week = false;
+    s_usage_range = ISLAND_USAGE_RANGE_DAY;
     s_usage_dirty = false;
-    s_ever_linked = false;
     s_drawn_state = -1;
+    s_drawn_quota = -2;
+    s_drawn_battery = -2;
     memset(&s_usage, 0, sizeof(s_usage));
+    memset(&s_usage_week, 0, sizeof(s_usage_week));
     s_lock = xSemaphoreCreateMutex();
     s_worker_done = xSemaphoreCreateBinary();
 
@@ -733,29 +826,41 @@ void demo_voice_enter(void)
     lv_obj_set_style_border_width(s_scr, 0, 0);
     lv_obj_set_style_pad_all(s_scr, 0, 0);
 
-    s_link_dot = dashboard_block(s_scr, 12, 17, 7, 7, DASH_MUTED, 4);
-    s_title = dashboard_label(s_scr, "AI PASSPORT", 26, 10,
+    s_title = dashboard_label(s_scr, "AI PASSPORT", 12, 10,
                               &lv_font_montserrat_14, DASH_PAPER);
-    s_link_state = dashboard_label(s_scr, "连接中", 120, 10,
-                                   &lv_font_ai_passport_14, DASH_MUTED);
-    lv_obj_set_width(s_link_state, 60);
-    lv_obj_set_style_text_align(s_link_state, LV_TEXT_ALIGN_RIGHT, 0);
-    dashboard_block(s_scr, 12, 39, 216, 1, DASH_LINE, 0);
-
-    s_battery = dashboard_label(s_scr, "--%", 184, 10,
+    s_battery = dashboard_label(s_scr, "--%", 0, 0,
                                 &lv_font_montserrat_14, DASH_MUTED);
-    lv_obj_set_width(s_battery, 44);
-    lv_obj_set_style_text_align(s_battery, LV_TEXT_ALIGN_RIGHT, 0);
+    s_battery_shell = dashboard_block(s_scr, 0, 0, 18, 10,
+                                      DASH_VOID, 3);
+    lv_obj_set_style_bg_opa(s_battery_shell, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_battery_shell, 1, 0);
+    lv_obj_set_style_border_color(s_battery_shell,
+                                  lv_color_hex(DASH_BATTERY), 0);
+    s_battery_fill = dashboard_block(s_battery_shell, 1, 1, 0, 8,
+                                     DASH_BATTERY, 2);
+    s_battery_cap = dashboard_block(s_scr, 0, 0, 2, 4,
+                                    DASH_BATTERY, 1);
+    s_link_icon = dashboard_label(s_scr, LV_SYMBOL_BLUETOOTH, 0, 0,
+                                  &lv_font_montserrat_14, DASH_MUTED);
+    refresh_header_battery();
+    dashboard_block(s_scr, 12, 34, 216, 1, DASH_LINE, 0);
 
-    lv_obj_t *primary = dashboard_block(s_scr, 12, 47, 216, 125,
+    lv_obj_t *primary = dashboard_block(s_scr, 12, 42, 216, 125,
                                         DASH_SURFACE, 9);
     lv_obj_set_style_border_width(primary, 1, 0);
     lv_obj_set_style_border_color(primary, lv_color_hex(DASH_LINE), 0);
 
     s_usage_layer = dashboard_block(primary, 1, 1, 214, 123,
                                     DASH_SURFACE, 8);
-    s_usage_kicker = dashboard_label(s_usage_layer, "TOKENS / LAST 24H", 10, 7,
+    s_usage_kicker = dashboard_label(s_usage_layer, "TOKENS / PC SYNC", 10, 7,
                                      &lv_font_montserrat_14, DASH_MUTED);
+    static const char *const range_text[2] = {"1D", "7D"};
+    for (size_t i = 0; i < 2; ++i) {
+        s_range_bg[i] = dashboard_block(s_usage_layer, 158 + (int)i * 25,
+                                        5, 23, 18, DASH_SURFACE, 5);
+        s_range_label[i] = dashboard_label(s_range_bg[i], range_text[i], 4, 1,
+                                           &lv_font_montserrat_14, DASH_MUTED);
+    }
     s_total = dashboard_label(s_usage_layer, "--", 10, 29,
                               &lv_font_montserrat_20, DASH_PAPER);
     s_peak = dashboard_label(s_usage_layer, "PC DATA --", 117, 32,
@@ -787,7 +892,7 @@ void demo_voice_enter(void)
     s_meter = dashboard_label(s_voice_layer, "..............", 10, 91,
                               &lv_font_montserrat_14, DASH_VOICE);
 
-    lv_obj_t *models = dashboard_block(s_scr, 12, 179, 216, 96,
+    lv_obj_t *models = dashboard_block(s_scr, 12, 174, 216, 96,
                                        DASH_SURFACE, 8);
     lv_obj_set_style_border_width(models, 1, 0);
     lv_obj_set_style_border_color(models, lv_color_hex(DASH_LINE), 0);
@@ -812,11 +917,18 @@ void demo_voice_enter(void)
                                          model_colors[i], 2);
     }
 
-    s_island = dashboard_label(s_scr, "CLAUDE --  CODEX --", 14, 287,
-                               &lv_font_montserrat_14, DASH_MUTED);
+    dashboard_label(s_scr, "CODEX", 14, 282,
+                    &lv_font_montserrat_14, DASH_MUTED);
+    lv_obj_t *quota_track = dashboard_block(s_scr, 72, 289,
+                                            QUOTA_TRACK_WIDTH, 4, 0x202322, 2);
+    s_quota_bar = dashboard_block(quota_track, 0, 0, 0, 4, DASH_BLUE, 2);
+    s_quota_value = dashboard_label(s_scr, "--", 190, 282,
+                                    &lv_font_montserrat_14, DASH_PAPER);
+    lv_obj_set_width(s_quota_value, 38);
+    lv_obj_set_style_text_align(s_quota_value, LV_TEXT_ALIGN_RIGHT, 0);
     set_visible(s_usage_layer, false);
     set_visible(s_voice_layer, true);
-    refresh_usage(&s_usage, false);
+    refresh_usage(&s_usage, false, &s_usage_week, false, s_usage_range);
 
     lv_screen_load(s_scr);
 
@@ -886,21 +998,22 @@ void demo_voice_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         }
         return;
     }
-    // OK fires on PRESS too. It used to wait for CLICK because its long-press
-    // leaves this screen for onboarding (main.c) and PRESS_DOWN also opens a long
-    // press — but that cost the whole hold plus the ~180 ms double-click window on
-    // every send, which is the single longest delay in the input path and the one
-    // that reads as "the button is slow".
-    //
-    // The collision resolves the way UP's already does: LONG_PRESS_START does not
-    // arrive until 1.5 s in, so a long press sends first and then leaves. Landing an
-    // Enter a second and a half before abandoning the screen for onboarding is
-    // harmless — it submits text the user was done with anyway — and every key on
-    // this screen now behaves the same way, acting at contact and letting the
-    // long-press supersede.
-    if (ev == BSP_BTN_PRESS) {
+    // OK reserves double-click for the dashboard's 1D/7D switch. Consequently a
+    // single send must use CLICK and wait for the button component's ~180 ms
+    // double-click discrimination window. DOWN recording and UP deletion remain
+    // immediate PRESS actions. main.c still owns OK's long-hold exit.
+    if (ev == BSP_BTN_DOUBLE && st == ST_IDLE) {
+        s_usage_range = island_usage_next_range(s_usage_range);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_usage_dirty = true;
+        xSemaphoreGive(s_lock);
+        return;
+    }
+    if (ev == BSP_BTN_CLICK ||
+        (ev == BSP_BTN_DOUBLE && st == ST_RECORDING)) {
         // While recording, OK means "I am done — send it": stop capture and send in
-        // one press, rather than making the user stop with DOWN and then send.
+        // one gesture, rather than making the user stop with DOWN and then send.
+        // A double-click during capture is treated as send, never as a range change.
         // The worker sees s_want_record go false, emits STOP, and then finds the
         // pending SEND, so the PC receives them in that order and 豆包 has finished
         // the utterance before Enter arrives.
