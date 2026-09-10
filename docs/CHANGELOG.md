@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+- Shorten the token dashboard heading from `TOKENS / PC SYNC` to `TOKENS / SYNC` to match the HTML preview.
+
 - Automatically promote token totals, per-model usage, and chart peaks from M to B, with two decimal places for billions and rounding consistent with the HTML preview.
 
 - Fixed the battery header remaining at `--%` even though the CW2017 answered on I2C: load and verify the supplied 80-byte profile for the 520 mAh cell, apply the required sleep/restart sequence, and wait up to five seconds for a valid SOC before exposing the gauge to the UI. Startup now logs the first valid SOC and cell voltage for hardware verification.

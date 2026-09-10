@@ -858,7 +858,7 @@ void demo_voice_enter(void)
 
     s_usage_layer = dashboard_block(primary, 1, 1, 214, 123,
                                     DASH_SURFACE, 8);
-    s_usage_kicker = dashboard_label(s_usage_layer, "TOKENS / PC SYNC", 10, 7,
+    s_usage_kicker = dashboard_label(s_usage_layer, "TOKENS / SYNC", 10, 7,
                                      &lv_font_montserrat_14, DASH_MUTED);
     static const char *const range_text[2] = {"1D", "7D"};
     for (size_t i = 0; i < 2; ++i) {
